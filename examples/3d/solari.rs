@@ -72,6 +72,7 @@ fn main() {
         app.add_systems(Update, toggle_dlss_rr);
 
         app.add_systems(Update, toggle_restir);
+        app.add_systems(Update, toggle_split);
 
         if args.many_lights != Some(true) {
             app.add_systems(Update, (pause_scene, toggle_lights, patrol_path));
@@ -486,6 +487,12 @@ fn toggle_restir(
     }
 }
 
+fn toggle_split(key_input: Res<ButtonInput<KeyCode>>, mut svgf: Single<&mut Svgf>) {
+    if key_input.just_pressed(KeyCode::KeyT) {
+        svgf.true_split = !svgf.true_split;
+    }
+}
+
 fn pause_scene(mut time: ResMut<Time<Virtual>>, key_input: Res<ButtonInput<KeyCode>>) {
     if key_input.just_pressed(KeyCode::Space) {
         time.toggle();
@@ -571,6 +578,7 @@ struct ControlText;
 fn update_control_text(
     mut text: Single<&mut Text, With<ControlText>>,
     solari_lighting: Single<&SolariLighting>,
+    svgf: Single<&Svgf>,
     robot_light_material: Option<Res<RobotLightMaterial>>,
     materials: Res<Assets<StandardMaterial>>,
     directional_light: Query<Entity, With<DirectionalLight>>,
@@ -622,7 +630,11 @@ fn update_control_text(
     }
 
     #[cfg(any(not(feature = "dlss"), feature = "force_disable_dlss"))]
-    text.0.push_str("\nDenoising: SVGF (DLSS not compiled)");
+    text.0.push_str(if svgf.true_split {
+        "\nDenoising: SVGF, (T): split = radiance AOV"
+    } else {
+        "\nDenoising: SVGF, (T): split = estimated"
+    });
 
     if solari_lighting.restir {
         text.0.push_str("\n(R): Disable ReSTIR");

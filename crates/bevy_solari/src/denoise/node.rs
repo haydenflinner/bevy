@@ -1,4 +1,5 @@
 use super::{prepare::ViewDenoiseResources, Svgf};
+use crate::realtime::prepare::SolariLightingResources;
 use bevy_asset::{load_embedded_asset, AssetServer, Handle};
 use bevy_core_pipeline::prepass::{
     PreviousViewData, PreviousViewUniformOffset, PreviousViewUniforms, ViewPrepassTextures,
@@ -51,6 +52,7 @@ pub fn solari_denoise(
         &ViewUniformOffset,
         &PreviousViewUniformOffset,
         &Svgf,
+        Option<&SolariLightingResources>,
     )>,
     pipelines: Option<Res<SolariDenoisePipelines>>,
     pipeline_cache: Res<PipelineCache>,
@@ -66,6 +68,7 @@ pub fn solari_denoise(
         view_uniform_offset,
         previous_view_uniform_offset,
         svgf,
+        solari_lighting_resources,
     ) = view.into_inner();
 
     let Some(pipelines) = pipelines else {
@@ -137,6 +140,11 @@ pub fn solari_denoise(
             &resources.spec_moments[read as usize].default_view,
             &resources.spec_history[write as usize].default_view,
             &resources.spec_moments[write as usize].default_view,
+            // Radiance-level specular AOV when `Svgf::true_split` is on; a dummy
+            // texture otherwise (params.use_aov == 0 makes the shader ignore it).
+            solari_lighting_resources.map_or(&resources.moments[read as usize].default_view, |r| {
+                &r.specular_radiance.default_view
+            }),
         )),
     );
 
@@ -270,6 +278,7 @@ pub fn init_denoise_pipelines(
                 texture_2d(TextureSampleType::Float { filterable: true }),
                 texture_storage_2d(TextureFormat::Rgba16Float, StorageTextureAccess::WriteOnly),
                 texture_storage_2d(TextureFormat::Rgba16Float, StorageTextureAccess::WriteOnly),
+                texture_2d(TextureSampleType::Float { filterable: false }),
             ),
         ),
     );

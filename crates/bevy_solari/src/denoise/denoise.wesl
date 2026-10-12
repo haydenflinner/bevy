@@ -21,12 +21,16 @@ import package::realtime::gbuffer_utils::{gpixel_resolve, pixel_dissimilar, Reso
 @group(0) @binding(15) var spec_moments_in: texture_2d<f32>;
 @group(0) @binding(16) var spec_history_out: texture_storage_2d<rgba16float, write>;
 @group(0) @binding(17) var spec_moments_out: texture_storage_2d<rgba16float, write>;
+@group(0) @binding(18) var spec_aov: texture_2d<f32>;
 
 struct DenoiseParams {
     max_history: f32,
     luma_sigma: f32,
     depth_sigma: f32,
     normal_sigma: f32,
+    /// When > 0.5, the specular stream reads Solari's radiance-level specular AOV
+    /// instead of using the env_brdf_approx2 estimate.
+    use_aov: f32,
 }
 
 fn luma(c: vec3<f32>) -> f32 {
@@ -88,10 +92,12 @@ fn temporal(@builtin(global_invocation_id) global_id: vec3<u32>) {
     if depth != 0.0 {
         surface = gpixel_resolve(gpixel, depth, pixel_id, size, view.world_from_clip);
         let m = surface.material;
-        let wo = normalize(view.world_position - surface.world_position);
-        let F0 = calculate_F0(m.base_color, m.metallic, vec3(m.reflectance));
-        w_spec = saturate(luma(env_brdf_approx2(F0, m.roughness, surface.world_normal, wo)));
         demod = max(luma(calculate_diffuse_color(m.base_color, m.metallic, 0.0, 0.0)), 0.05);
+        if params.use_aov < 0.5 {
+            let wo = normalize(view.world_position - surface.world_position);
+            let F0 = calculate_F0(m.base_color, m.metallic, vec3(m.reflectance));
+            w_spec = saturate(luma(env_brdf_approx2(F0, m.roughness, surface.world_normal, wo)));
+        }
     }
 
     // 5x5 neighborhood statistics of the current noisy frame (more samples →
@@ -99,6 +105,7 @@ fn temporal(@builtin(global_invocation_id) global_id: vec3<u32>) {
     // rejection, and as a spatial fallback when reprojected history is rejected.
     var sum = vec3(0.0);
     var sumsq = vec3(0.0);
+    var ssum = vec3(0.0);
     var lsum = 0.0;
     var lsumsq = 0.0;
     var count = 0.0;
@@ -113,11 +120,15 @@ fn temporal(@builtin(global_invocation_id) global_id: vec3<u32>) {
                 lsum += cl;
                 lsumsq += cl * cl;
                 count += 1.0;
+                if params.use_aov > 0.5 {
+                    ssum += textureLoad(spec_aov, vec2u(p), 0).rgb;
+                }
             }
         }
     }
     let nmean = sum / count;
     let nstd = sqrt(max(sumsq / count - nmean * nmean, vec3(0.0)));
+    let smean = ssum / count;
     let lmean = lsum / count;
     let lstd = sqrt(max(lsumsq / count - lmean * lmean, 0.0));
 
@@ -128,21 +139,42 @@ fn temporal(@builtin(global_invocation_id) global_id: vec3<u32>) {
     }
 
     // Split into diffuse (demodulated) and specular shares; they recombine exactly.
-    let noisy_diff = noisy * (1.0 - w_spec) / demod;
-    let noisy_spec = noisy * w_spec;
+    // With `use_aov`, Solari tracked the first-bounce lobe attribution itself and
+    // wrote the specular share to `spec_aov`; diffuse is what remains.
+    var noisy_spec: vec3<f32>;
+    var noisy_diff: vec3<f32>;
+    var f_spec: vec3<f32>;
+    var f_diff: vec3<f32>;
+    if params.use_aov > 0.5 {
+        noisy_spec = textureLoad(spec_aov, pixel_id, 0).rgb;
+        noisy_diff = max(noisy - noisy_spec, vec3(0.0)) / demod;
+        // The share factors scale the *neighborhood* stats into each stream's
+        // units for clipping and fallback. They must come from the neighborhood
+        // mean, not this pixel's sample — at 1spp most samples are misses, which
+        // would zero the clip bounds and starve the history.
+        f_spec = smean / max(nmean, vec3(0.001));
+        f_diff = max(nmean - smean, vec3(0.0)) / max(nmean, vec3(0.001)) / demod;
+    } else {
+        noisy_spec = noisy * w_spec;
+        noisy_diff = noisy * (1.0 - w_spec) / demod;
+        f_spec = vec3(w_spec);
+        f_diff = vec3((1.0 - w_spec) / demod);
+    }
     let l_diff = luma(noisy_diff);
     let l_spec = luma(noisy_spec);
+    // Scalar luma shares of the neighborhood mean, for scaling the moments.
+    let l_noisy = max(luma(nmean), 0.001);
+    let sf_diff = luma(f_diff * nmean) / l_noisy;
+    let sf_spec = luma(f_spec * nmean) / l_noisy;
 
     // Defaults when there is no usable history: a filtered neighborhood estimate
     // rather than raw noise, so disoccluded and marginal pixels still look okay.
-    let f_diff = (1.0 - w_spec) / demod;
-    let f_spec = w_spec;
     var diff_color = nmean * f_diff;
     var spec_color = nmean * f_spec;
     var diff_len = 1.0;
     var spec_len = 1.0;
-    var diff_moments = vec2(lmean * f_diff, (lmean * lmean + lstd * lstd) * f_diff * f_diff);
-    var spec_moments = vec2(lmean * f_spec, (lmean * lmean + lstd * lstd) * f_spec * f_spec);
+    var diff_moments = vec2(lmean * sf_diff, (lmean * lmean + lstd * lstd) * sf_diff * sf_diff);
+    var spec_moments = vec2(lmean * sf_spec, (lmean * lmean + lstd * lstd) * sf_spec * sf_spec);
 
     // Motion vectors are in UV units, pointing from the previous to the current frame.
     let mv = textureLoad(motion_vectors, pixel_id, 0).xy;

@@ -101,6 +101,11 @@ pub struct Svgf {
     /// take longer to react to lighting changes (ghosting is mostly suppressed by
     /// neighborhood clamping and the disocclusion test).
     pub max_history: f32,
+    /// When true, the diffuse/specular split consumes Solari's radiance-level
+    /// specular AOV (first-bounce lobe attribution tracked inside the path
+    /// tracer) instead of estimating the specular share per pixel with the
+    /// `env_brdf_approx2` heuristic.
+    pub true_split: bool,
 }
 
 impl Default for Svgf {
@@ -108,6 +113,7 @@ impl Default for Svgf {
         Self {
             iterations: 5,
             max_history: 64.0,
+            true_split: false,
         }
     }
 }

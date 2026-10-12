@@ -23,7 +23,10 @@ enable wgpu_ray_query;
 @group(1) @binding(11) var previous_depth_buffer: texture_depth_2d;
 @group(1) @binding(12) var<storage, read_write> reservoirs_a: array<Reservoir>;
 @group(1) @binding(13) var<storage, read_write> reservoirs_b: array<Reservoir>;
+@group(1) @binding(14) var specular_radiance_out: texture_storage_2d<rgba16float, read_write>;
 }
+@if(!RESTIR)
+@group(1) @binding(10) var specular_radiance_out: texture_storage_2d<rgba16float, read_write>;
 
 @if(DLSS_RR_GUIDE_BUFFERS) {
 @group(2) @binding(0) var diffuse_albedo: texture_storage_2d<rgba8unorm, write>;

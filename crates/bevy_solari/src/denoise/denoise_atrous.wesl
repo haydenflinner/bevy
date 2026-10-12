@@ -16,6 +16,7 @@ struct DenoiseParams {
     luma_sigma: f32,
     depth_sigma: f32,
     normal_sigma: f32,
+    use_aov: f32,
 }
 
 fn luma(c: vec3<f32>) -> f32 {

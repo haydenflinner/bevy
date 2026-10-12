@@ -3,10 +3,10 @@
 import bevy_core_pipeline::tonemapping::tonemapping_luminance as luminance;
 import bevy_pbr::render::utils::{rand_f, rand_u, sample_disk};
 import bevy_render::utils::octahedral_decode;
-import package::scene::brdf::{brdf_pdf, evaluate_brdf, F_AB};
+import package::scene::brdf::{brdf_pdf, evaluate_brdf, evaluate_diffuse_brdf, evaluate_specular_brdf, F_AB};
 import package::realtime::gbuffer_utils::{gpixel_resolve, permute_pixel, pixel_dissimilar};
 import package::realtime::initial_path::{generate_initial_path, InitialSamplingResult, nee_probability};
-import package::realtime::bindings::{depth_buffer, empty_reservoir, gbuffer, load_motion_vector, previous_depth_buffer, previous_gbuffer, previous_view, reservoirs_a, reservoirs_b, Reservoir, constants, view, view_output};
+import package::realtime::bindings::{depth_buffer, empty_reservoir, gbuffer, load_motion_vector, previous_depth_buffer, previous_gbuffer, previous_view, reservoirs_a, reservoirs_b, Reservoir, constants, specular_radiance_out, view, view_output};
 import package::scene::sampling::{balance_heuristic, calculate_resolved_light_contribution, isinf, isnan, LightSample, NULL_LIGHT_ID, power_heuristic, resolve_light_sample, ResolvedLightSample, trace_visibility, trace_visibility_previous_frame};
 import package::scene::bindings::{light_sources, LIGHT_NOT_PRESENT_THIS_FRAME, previous_frame_light_id_translations, RAY_T_MAX, RAY_T_MIN, ResolvedMaterial};
 import package::realtime::world_cache_query::{query_world_cache, WORLD_CACHE_CELL_LIFETIME};
@@ -25,12 +25,14 @@ fn initial_and_temporal(@builtin(workgroup_id) workgroup_id: vec3<u32>, @builtin
     let depth = textureLoad(depth_buffer, global_id.xy, 0);
     if depth == 0.0 {
         reservoirs_b[pixel_index] = empty_reservoir();
+        textureStore(specular_radiance_out, global_id.xy, vec4(0.0));
         return;
     }
     let surface = gpixel_resolve(textureLoad(gbuffer, global_id.xy, 0), depth, global_id.xy, view.main_pass_viewport.zw, view.world_from_clip);
 
     let initial = generate_initial_path(surface.world_position, surface.world_normal, surface.material, workgroup_id.xy, global_id.xy, &rng);
     textureStore(view_output, global_id.xy, vec4(initial.radiance, 0.0));
+    textureStore(specular_radiance_out, global_id.xy, vec4(initial.specular_radiance, 0.0));
 
     let temporal = load_temporal_reservoir(global_id.xy, depth, surface.world_position, surface.world_normal);
     let previous_camera_homogeneous = previous_view.world_from_clip * (previous_view.clip_from_view * vec4(0.0, 0.0, 0.0, 1.0));
@@ -62,11 +64,21 @@ fn spatial_and_shade(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
     reservoirs_a[pixel_index] = merge_result.merged_reservoir;
 
-    var pixel_color = merge_result.selected_sample_brdf_radiance * merge_result.merged_reservoir.unbiased_contribution_weight;
+    let weight = merge_result.merged_reservoir.unbiased_contribution_weight;
+    var pixel_color = merge_result.selected_sample_brdf_radiance * weight;
     pixel_color += surface.material.emissive;
     pixel_color += textureLoad(view_output, global_id.xy).rgb;
     pixel_color *= view.exposure;
     textureStore(view_output, global_id.xy, vec4(pixel_color, 1.0));
+
+    // Specular AOV: the selected candidate's specular-lobe share, plus the primary
+    // surface's emissive (unmodulated light, it belongs in the unmodulated stream),
+    // plus specular leftovers shaded directly in the initial pass.
+    var specular_color = merge_result.selected_sample_specular_radiance * weight;
+    specular_color += surface.material.emissive;
+    specular_color += textureLoad(specular_radiance_out, global_id.xy).rgb;
+    specular_color *= view.exposure;
+    textureStore(specular_radiance_out, global_id.xy, vec4(specular_color, 1.0));
 
     @if(VISUALIZE_WORLD_CACHE)
     textureStore(view_output, global_id.xy, vec4(query_world_cache(surface.world_position, surface.world_normal, view.world_position, RAY_T_MAX, WORLD_CACHE_CELL_LIFETIME, &rng) * view.exposure, 1.0));
@@ -174,6 +186,9 @@ fn jacobian(
 struct ReservoirMergeResult {
     merged_reservoir: Reservoir,
     selected_sample_brdf_radiance: vec3<f32>,
+    /// The specular-lobe share of `selected_sample_brdf_radiance` at the
+    /// canonical surface's BRDF.
+    selected_sample_specular_radiance: vec3<f32>,
 }
 
 fn merge_reservoirs(
@@ -200,7 +215,7 @@ fn merge_reservoirs(
 
     // Skip resampling empty reservoirs
     if other_reservoir.confidence_weight == 0.0 {
-        return ReservoirMergeResult(canonical_reservoir, canonical_sample_at_canonical.brdf_radiance);
+        return ReservoirMergeResult(canonical_reservoir, canonical_sample_at_canonical.brdf_radiance, canonical_sample_at_canonical.specular_radiance);
     }
 
     var other_resolved: ResolvedLightSample;
@@ -294,7 +309,7 @@ fn merge_reservoirs(
         let inverse_target_function = select(0.0, 1.0 / other_sample_at_canonical.target_function, other_sample_at_canonical.target_function > 0.0);
         combined_reservoir.unbiased_contribution_weight = weight_sum * inverse_target_function;
 
-        return ReservoirMergeResult(combined_reservoir, other_sample_at_canonical.brdf_radiance);
+        return ReservoirMergeResult(combined_reservoir, other_sample_at_canonical.brdf_radiance, other_sample_at_canonical.specular_radiance);
     } else {
         combined_reservoir.sample_point_world_position = canonical_reservoir.sample_point_world_position;
         combined_reservoir.sample_point_world_normal = canonical_reservoir.sample_point_world_normal;
@@ -304,12 +319,15 @@ fn merge_reservoirs(
         let inverse_target_function = select(0.0, 1.0 / canonical_sample_at_canonical.target_function, canonical_sample_at_canonical.target_function > 0.0);
         combined_reservoir.unbiased_contribution_weight = weight_sum * inverse_target_function;
 
-        return ReservoirMergeResult(combined_reservoir, canonical_sample_at_canonical.brdf_radiance);
+        return ReservoirMergeResult(combined_reservoir, canonical_sample_at_canonical.brdf_radiance, canonical_sample_at_canonical.specular_radiance);
     }
 }
 
 struct ReservoirContribution {
     brdf_radiance: vec3<f32>,
+    /// The specular-lobe share of `brdf_radiance` (both are evaluated through the
+    /// surface's BRDF for the sample's incoming direction).
+    specular_radiance: vec3<f32>,
     target_function: f32,
     sample_world_position: vec4<f32>,
 }
@@ -331,13 +349,19 @@ fn reservoir_contribution(reservoir: Reservoir, resolved: ResolvedLightSample, w
             nee_mis_weight = power_heuristic(p_nee_strategy, p_brdf_at_nee);
         }
 
-        let brdf_radiance = light_contribution.radiance * evaluate_brdf(wo, light_contribution.wi, world_normal, material, F_ab) * nee_mis_weight;
-        return ReservoirContribution(brdf_radiance, luminance(brdf_radiance), resolved.world_position);
+        let brdf_diffuse = evaluate_diffuse_brdf(wo, light_contribution.wi, world_normal, material, F_ab);
+        let brdf_specular = evaluate_specular_brdf(wo, light_contribution.wi, world_normal, material, F_ab);
+        let brdf_radiance = light_contribution.radiance * (brdf_diffuse + brdf_specular) * nee_mis_weight;
+        let specular_radiance = light_contribution.radiance * brdf_specular * nee_mis_weight;
+        return ReservoirContribution(brdf_radiance, specular_radiance, luminance(brdf_radiance), resolved.world_position);
     } else if any(reservoir.radiance != vec3(0.0)) {
         let delta = reservoir.sample_point_world_position - (world_position + world_normal * RAY_T_MIN);
         let sample_distance = length(delta);
         let wi = delta / sample_distance;
-        var brdf_radiance = reservoir.radiance * evaluate_brdf(wo, wi, world_normal, material, F_ab);
+        let brdf_diffuse = evaluate_diffuse_brdf(wo, wi, world_normal, material, F_ab);
+        let brdf_specular = evaluate_specular_brdf(wo, wi, world_normal, material, F_ab);
+        var brdf_radiance = reservoir.radiance * (brdf_diffuse + brdf_specular);
+        var specular_radiance = reservoir.radiance * brdf_specular;
 
         // Bounce-0 BRDF-emissive sample (directly-visible light). The seed field carries the light
         // triangle's bitcast area pdf, and the stored radiance is the raw emission. Rebuild the MIS
@@ -349,16 +373,19 @@ fn reservoir_contribution(reservoir: Reservoir, resolved: ResolvedLightSample, w
             let cos_theta_light = dot(-wi, light_normal);
             if cos_theta_light <= 0.0 {
                 brdf_radiance = vec3(0.0);
+                specular_radiance = vec3(0.0);
             } else {
                 let p_light = area_pdf * sample_distance * sample_distance / cos_theta_light;
                 let p_nee = nee_probability(material);
                 let p_brdf = brdf_pdf(wo, wi, world_normal, material, F_ab);
-                brdf_radiance *= power_heuristic(p_brdf, p_light * p_nee * f32(constants.primary_di_samples));
+                let mis = power_heuristic(p_brdf, p_light * p_nee * f32(constants.primary_di_samples));
+                brdf_radiance *= mis;
+                specular_radiance *= mis;
             }
         }
 
-        return ReservoirContribution(brdf_radiance, luminance(brdf_radiance), vec4(reservoir.sample_point_world_position, 1.0));
+        return ReservoirContribution(brdf_radiance, specular_radiance, luminance(brdf_radiance), vec4(reservoir.sample_point_world_position, 1.0));
     } else {
-        return ReservoirContribution(vec3(0.0), 0.0, vec4(reservoir.sample_point_world_position, 1.0));
+        return ReservoirContribution(vec3(0.0), vec3(0.0), 0.0, vec4(reservoir.sample_point_world_position, 1.0));
     }
 }

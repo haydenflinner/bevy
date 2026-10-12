@@ -222,6 +222,7 @@ pub fn solari_lighting(
             previous_view_uniforms_binding.clone(),
             s.world_cache.as_entire_binding(),
             s.constants.as_entire_binding(),
+            &s.specular_radiance.default_view,
         )),
     );
 
@@ -245,6 +246,7 @@ pub fn solari_lighting(
                     previous_depth_buffer,
                     reservoirs.a.as_entire_binding(),
                     reservoirs.b.as_entire_binding(),
+                    &s.specular_radiance.default_view,
                 )),
             )
         });
@@ -430,6 +432,7 @@ pub fn init_solari_lighting_pipelines(
                 uniform_buffer::<PreviousViewData>(true),
                 storage_buffer_sized(false, None),
                 uniform_buffer_sized(false, None),
+                texture_storage_2d(TextureFormat::Rgba16Float, StorageTextureAccess::ReadWrite),
             ),
         ),
     );
@@ -453,6 +456,7 @@ pub fn init_solari_lighting_pipelines(
                 texture_depth_2d(),
                 storage_buffer_sized(false, None),
                 storage_buffer_sized(false, None),
+                texture_storage_2d(TextureFormat::Rgba16Float, StorageTextureAccess::ReadWrite),
             ),
         ),
     );

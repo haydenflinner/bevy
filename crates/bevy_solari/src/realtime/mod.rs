@@ -1,6 +1,6 @@
 mod extract;
 pub(crate) mod node;
-mod prepare;
+pub(crate) mod prepare;
 
 use crate::{
     scene::{prepare_raytracing_scene_resources, RaytracingSceneBindings},

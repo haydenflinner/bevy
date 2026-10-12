@@ -41,6 +41,19 @@ fn specular_lobe_sampling_probability(rho: LobeReflectances, perceptual_roughnes
     return max(energy_probability, roughness_biased_probability);
 }
 
+/// The specular lobe's share of the BRDF's hemispherical reflectance for this
+/// view/material — the split weight for the specular radiance AOV. Unlike
+/// specular_lobe_sampling_probability this is the raw energy share, without the
+/// sampling bias toward smooth surfaces.
+fn specular_energy_fraction(wo: vec3<f32>, world_normal: vec3<f32>, material: ResolvedMaterial, F_ab: vec2<f32>) -> f32 {
+    if dot(world_normal, wo) < 0.0001 { return 0.0; }
+    let F0_metal = material.base_color;
+    let F0_dielectric = calculate_F0_dielectric(vec3(material.reflectance));
+    let rho = lobe_reflectances(F0_metal, F0_dielectric, material, F_ab);
+    let specular_luminance = luminance(rho.specular);
+    return specular_luminance / max(specular_luminance + luminance(rho.diffuse), 0.0001);
+}
+
 fn evaluate_and_sample_brdf(
     wo: vec3<f32>,
     world_normal: vec3<f32>,

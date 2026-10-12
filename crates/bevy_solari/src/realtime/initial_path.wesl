@@ -2,7 +2,7 @@ import bevy_core_pipeline::tonemapping::tonemapping_luminance as luminance;
 import bevy_pbr::render::utils::{rand_f, rand_range_u};
 import bevy_render::maths::PI;
 import bevy_render::utils::octahedral_encode;
-import package::scene::brdf::{brdf_pdf, evaluate_and_sample_brdf, evaluate_brdf, EvaluateAndSampleBrdfResult, F_AB};
+import package::scene::brdf::{brdf_pdf, evaluate_and_sample_brdf, evaluate_brdf, specular_energy_fraction, EvaluateAndSampleBrdfResult, F_AB};
 import package::realtime::presample_light_tiles::unpack_resolved_light_sample;
 import package::realtime::bindings::{empty_reservoir, light_tile_resolved_samples, light_tile_samples, Reservoir, constants, view};
 import package::scene::sampling::{calculate_resolved_light_contribution, isinf, LightSample, NULL_LIGHT_ID, power_heuristic, trace_visibility, sample_environment_map_light};
@@ -28,6 +28,10 @@ const CACHE_TERMINATION_MIN_SOLID_ANGLE = PI;
 struct InitialSamplingResult {
     @if(RESTIR) reservoir: Reservoir,
     radiance: vec3<f32>,
+    /// The specular share of `radiance`: contributions attributed to the specular
+    /// lobe at x1 by first-bounce BRDF evaluation. `radiance` still holds the
+    /// total; the two overlap, they do not partition.
+    specular_radiance: vec3<f32>,
 }
 
 /// Path vertices use the following convention: x0 = camera, x1 = primary ray hit (the G-buffer
@@ -49,6 +53,13 @@ struct PathState {
     @if(RESTIR) x1_brdf: vec3<f32>,
     /// Radiance shaded directly at this pixel
     radiance: vec3<f32>,
+    /// `radiance`'s overlap: the share of every contribution attributed to the
+    /// specular lobe at x1, using the BRDF evaluated at the direction the
+    /// contribution's energy actually arrived from.
+    specular_radiance: vec3<f32>,
+    /// specular_brdf / brdf at x1 for the first BRDF-sampled direction, the share
+    /// of every x1-carrying contribution that belongs to the specular stream.
+    x1_spec_fraction: vec3<f32>,
     @if(RESTIR) reservoir: Reservoir,
     @if(RESTIR) weight_sum: f32,
     @if(RESTIR) selected_target_function: f32,
@@ -62,6 +73,8 @@ fn new_path_state(world_position: vec3<f32>, world_normal: vec3<f32>, wo: vec3<f
     path.material = material;
     path.throughput_past_first_hit = vec3(1.0);
     path.radiance = vec3(0.0);
+    path.specular_radiance = vec3(0.0);
+    path.x1_spec_fraction = vec3(0.0);
     @if(RESTIR) {
         path.x1_brdf = vec3(0.0);
         path.x2_position = vec3(0.0);
@@ -96,6 +109,14 @@ fn generate_initial_path(world_position: vec3<f32>, world_normal: vec3<f32>, mat
         // Sample the BRDF and trace the next ray
         let next_bounce = evaluate_and_sample_brdf(path.wo, path.normal, path.material, F_ab, rng);
         if next_bounce.pdf == 0.0 { break; }
+
+        if bounce == 0u {
+            // The specular lobe's share of x1's hemispherical BRDF response for
+            // this view. Every deeper contribution's energy arrived through the
+            // x1 lobe, so this fraction is their expected specular share.
+            path.x1_spec_fraction = vec3(specular_energy_fraction(wo, world_normal, material, primary_F_ab));
+        }
+
         let ray = trace_ray(path.ray_origin, next_bounce.wi, RAY_T_MIN, RAY_T_MAX, RAY_FLAG_NONE);
 
         if ray.kind == RAY_QUERY_INTERSECTION_NONE {
@@ -108,7 +129,9 @@ fn generate_initial_path(world_position: vec3<f32>, world_normal: vec3<f32>, mat
             @if(RESTIR) {
                 generate_environment_map_light_candidate(&path, next_bounce, environment_map_light_radiance, primary_F_ab, bounce, rng);
             } @else {
-                path.radiance += path.throughput_past_first_hit * next_bounce.throughput * environment_map_light_radiance;
+                accumulate_radiance(&path,
+                    path.throughput_past_first_hit * next_bounce.throughput * environment_map_light_radiance,
+                    path.x1_spec_fraction);
             }
 
             break;
@@ -193,6 +216,7 @@ fn generate_initial_path(world_position: vec3<f32>, world_normal: vec3<f32>, mat
 
     var result: InitialSamplingResult;
     result.radiance = path.radiance;
+    result.specular_radiance = path.specular_radiance;
     @if(RESTIR) {
         if path.selected_target_function > 0.0 {
             path.reservoir.unbiased_contribution_weight = path.weight_sum / path.selected_target_function;
@@ -200,6 +224,14 @@ fn generate_initial_path(world_position: vec3<f32>, world_normal: vec3<f32>, mat
         result.reservoir = path.reservoir;
     }
     return result;
+}
+
+/// Adds `contribution` to the total radiance, and `contribution * spec_fraction`
+/// to the specular radiance. `spec_fraction` is the specular energy share of x1's
+/// BRDF for this view — see `specular_energy_fraction`.
+fn accumulate_radiance(path: ptr<function, PathState>, contribution: vec3<f32>, spec_fraction: vec3<f32>) {
+    (*path).radiance += contribution;
+    (*path).specular_radiance += contribution * spec_fraction;
 }
 
 /// Probability of running NEE for lights that BRDF rays can also hit, proportional to how diffuse the
@@ -257,7 +289,9 @@ fn generate_nee_candidate(
                 (*path).selected_target_function = target_function;
             }
         } @else {
-            (*path).radiance += di.brdf_radiance * di.unbiased_contribution_weight * nee_mis_weight / p_keep;
+            accumulate_radiance(path,
+                di.brdf_radiance * di.unbiased_contribution_weight * nee_mis_weight / p_keep,
+                (*path).x1_spec_fraction);
         }
     } else {
         // Deeper bounces: Candidate is the reconnection radiance at x2
@@ -266,7 +300,7 @@ fn generate_nee_candidate(
         @if(RESTIR) {
             resample_reconnection_candidate(path, L_at_reconnection, rng);
         } @else {
-            (*path).radiance += L_at_reconnection;
+            accumulate_radiance(path, L_at_reconnection, (*path).x1_spec_fraction);
         }
     }
 }
@@ -347,7 +381,9 @@ fn generate_emissive_candidate(
             // x1 -> x2 not reuse-safe (mirror/sharp lobe or failed gate): shade directly at this pixel
             // instead of publishing, since a reuse shift would waste it or make a firefly. Mirror lobes
             // always land here (p_brdf = INF, footprint 0), where emissive_mis_weight is 1.
-            (*path).radiance += (*path).x1_brdf * (*path).throughput_past_first_hit * ray_hit.material.emissive * emissive_mis_weight;
+            accumulate_radiance(path,
+                (*path).x1_brdf * (*path).throughput_past_first_hit * ray_hit.material.emissive * emissive_mis_weight,
+                (*path).x1_spec_fraction);
         } else if bounce == 0u {
             // Bounce 0: Candidate is the emissive hit
             let target_function = luminance((*path).x1_brdf * ray_hit.material.emissive) * emissive_mis_weight;
@@ -367,7 +403,9 @@ fn generate_emissive_candidate(
             resample_reconnection_candidate(path, emissive_L_at_reconnection, rng);
         }
     } @else {
-        (*path).radiance += (*path).throughput_past_first_hit * ray_hit.material.emissive * emissive_mis_weight;
+        accumulate_radiance(path,
+            (*path).throughput_past_first_hit * ray_hit.material.emissive * emissive_mis_weight,
+            (*path).x1_spec_fraction);
     }
 }
 
@@ -385,7 +423,7 @@ fn generate_environment_map_light_candidate(
     if bounce == 0u {
         // Bounce 0: Candidate is the sky direction
         if !x1_lobe_reusable(next_bounce.pdf, next_bounce.diffuse_selected, (*path).material.perceptual_roughness) {
-            (*path).radiance += next_bounce.throughput * environment_map_light_radiance;
+            accumulate_radiance(path, next_bounce.throughput * environment_map_light_radiance, (*path).x1_spec_fraction);
             return;
         }
 
@@ -443,7 +481,7 @@ fn terminate_into_cache(
     @if(RESTIR) {
         resample_reconnection_candidate(path, cache_L_at_reconnection, rng);
     } @else {
-        (*path).radiance += cache_L_at_reconnection;
+        accumulate_radiance(path, cache_L_at_reconnection, (*path).x1_spec_fraction);
     }
 
     return true;
@@ -455,7 +493,7 @@ fn terminate_into_cache(
 fn resample_reconnection_candidate(path: ptr<function, PathState>, L_at_reconnection: vec3<f32>, rng: ptr<function, u32>) {
     if !(*path).x2_reusable {
         // x1 -> x2 not reuse-safe: shade directly at this pixel instead of publishing.
-        (*path).radiance += (*path).x1_brdf * L_at_reconnection;
+        accumulate_radiance(path, (*path).x1_brdf * L_at_reconnection, (*path).x1_spec_fraction);
         return;
     }
 

@@ -59,9 +59,13 @@ pub fn prepare_svgf(
 
         let params = [
             svgf.max_history,
-            6.0,   // luma_sigma
-            1.0,   // depth_sigma
-            128.0, // normal_sigma
+            6.0,                                     // luma_sigma
+            1.0,                                     // depth_sigma
+            128.0,                                   // normal_sigma
+            if svgf.true_split { 1.0 } else { 0.0 }, // use_aov
+            0.0,
+            0.0,
+            0.0,
         ];
 
         if let Some(mut resources) = resources.filter(|r| r.view_size == view_size) {

@@ -13,19 +13,15 @@ use bevy_ecs::{
     entity::Entity,
     system::{Commands, Query, Res},
 };
-#[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
 use bevy_image::ToExtents;
 use bevy_math::UVec2;
 use bevy_render::{
     camera::ExtractedCamera,
-    render_resource::{Buffer, BufferDescriptor, BufferInitDescriptor, BufferUsages},
-    renderer::{RenderDevice, RenderQueue},
-};
-#[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
-use bevy_render::{
     render_resource::{
-        TextureDescriptor, TextureDimension, TextureFormat, TextureUsages, TextureViewDescriptor,
+        Buffer, BufferDescriptor, BufferInitDescriptor, BufferUsages, TextureDescriptor,
+        TextureDimension, TextureFormat, TextureUsages, TextureViewDescriptor,
     },
+    renderer::{RenderDevice, RenderQueue},
     texture::CachedTexture,
 };
 use bytemuck::{Pod, Zeroable};
@@ -117,6 +113,9 @@ pub struct SolariLightingResources {
     pub light_tile_samples: Buffer,
     pub light_tile_resolved_samples: Buffer,
     pub reservoirs: Option<SolariReservoirBuffers>,
+    /// Specular AOV: the share of `view_output` radiance attributed to the
+    /// specular lobe at the primary surface, plus unmodulated emission.
+    pub specular_radiance: CachedTexture,
     pub world_cache: Buffer,
     pub world_cache_active_cells_dispatch: Buffer,
     pub view_size: UVec2,
@@ -236,11 +235,27 @@ pub fn prepare_solari_lighting_resources(
             mapped_at_creation: false,
         });
 
+        let specular_radiance_texture = render_device.create_texture(&TextureDescriptor {
+            label: Some("solari_lighting_specular_radiance"),
+            size: view_size.to_extents(),
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: TextureFormat::Rgba16Float,
+            usage: TextureUsages::TEXTURE_BINDING | TextureUsages::STORAGE_BINDING,
+            view_formats: &[],
+        });
+        let specular_radiance = CachedTexture {
+            default_view: specular_radiance_texture.create_view(&TextureViewDescriptor::default()),
+            texture: specular_radiance_texture,
+        };
+
         commands.entity(entity).insert(SolariLightingResources {
             constants,
             light_tile_samples,
             light_tile_resolved_samples,
             reservoirs,
+            specular_radiance,
             world_cache,
             world_cache_active_cells_dispatch,
             view_size,
