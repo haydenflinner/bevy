@@ -13,7 +13,7 @@ use bevy_render::{
         BindGroupEntries, BindGroupLayoutDescriptor, BindGroupLayoutEntries,
         CachedComputePipelineId, ComputePassDescriptor, ComputePipelineDescriptor, PipelineCache,
         SamplerBindingType, SamplerDescriptor, ShaderStages, StorageTextureAccess, TextureFormat,
-        TextureSampleType,
+        TextureSampleType, TextureView,
     },
     renderer::{RenderContext, RenderDevice, ViewQuery},
     view::{ViewTarget, ViewUniform, ViewUniformOffset, ViewUniforms},
@@ -31,6 +31,7 @@ pub struct SolariDenoisePipelines {
     atrous_bind_group_layout: BindGroupLayoutDescriptor,
     temporal_pipeline: CachedComputePipelineId,
     atrous_pipelines: [CachedComputePipelineId; 5],
+    spec_atrous_pipelines: [CachedComputePipelineId; 5],
     writeback_pipeline: CachedComputePipelineId,
 }
 
@@ -94,10 +95,15 @@ pub fn solari_denoise(
         return;
     };
 
-    let (Some(writeback_pipeline), Some(atrous_pipelines)) = (
+    let (Some(writeback_pipeline), Some(atrous_pipelines), Some(spec_atrous_pipelines)) = (
         pipeline_cache.get_compute_pipeline(pipelines.writeback_pipeline),
         pipelines
             .atrous_pipelines
+            .iter()
+            .map(|id| pipeline_cache.get_compute_pipeline(*id))
+            .collect::<Option<Vec<_>>>(),
+        pipelines
+            .spec_atrous_pipelines
             .iter()
             .map(|id| pipeline_cache.get_compute_pipeline(*id))
             .collect::<Option<Vec<_>>>(),
@@ -127,6 +133,10 @@ pub fn solari_denoise(
             &resources.moments[write as usize].default_view,
             resources.params.as_entire_binding(),
             &sampler,
+            &resources.spec_history[read as usize].default_view,
+            &resources.spec_moments[read as usize].default_view,
+            &resources.spec_history[write as usize].default_view,
+            &resources.spec_moments[write as usize].default_view,
         )),
     );
 
@@ -153,54 +163,78 @@ pub fn solari_denoise(
     pass.set_pipeline(temporal_pipeline);
     pass.dispatch_workgroups(dx, dy, 1);
 
-    // À-trous iterations ping-pong between the scratch texture and the now-free "read"
-    // history texture, all in demodulated-lighting space. A final writeback pass
-    // re-modulates by the surface albedo into the view target.
-    let history = &resources.history;
+    // À-trous iterations ping-pong between each stream's scratch textures, all in
+    // demodulated (diffuse) or raw (specular) lighting space. The diffuse stream
+    // uses `filtered` and the freed diffuse read-history; the specular stream
+    // reuses both freed read-histories. A final writeback pass recombines the
+    // streams into the view target.
     let filtered = &resources.filtered;
-    let spare = &history[read as usize];
-    let mut last_dst = &filtered.default_view;
-    for i in 0..iterations {
-        let (src, dst) = if i == 0 {
-            (
-                &history[write as usize].default_view,
-                &filtered.default_view,
-            )
-        } else if i % 2 == 1 {
-            (&filtered.default_view, &spare.default_view)
-        } else {
-            (&spare.default_view, &filtered.default_view)
-        };
-        let bind_group = render_device.create_bind_group(
-            "solari_denoise_atrous_bind_group",
-            &pipeline_cache.get_bind_group_layout(&pipelines.atrous_bind_group_layout),
-            &BindGroupEntries::sequential((
-                src,
-                dst,
-                gbuffer,
-                depth_buffer,
-                &resources.moments[write as usize].default_view,
-                view_uniforms_binding.clone(),
-                resources.params.as_entire_binding(),
-            )),
-        );
-        pass.set_bind_group(0, &bind_group, &[view_uniform_offset.offset]);
-        pass.set_pipeline(atrous_pipelines[i]);
-        pass.dispatch_workgroups(dx, dy, 1);
-        last_dst = dst;
+    let diffuse_spare = &resources.history[read as usize];
+    let spec_spare = &resources.spec_history[read as usize];
+    let streams = [
+        (
+            &atrous_pipelines,
+            &resources.history[write as usize].default_view,
+            &filtered.default_view,
+            &diffuse_spare.default_view,
+            &resources.moments[write as usize].default_view,
+        ),
+        (
+            &spec_atrous_pipelines,
+            &resources.spec_history[write as usize].default_view,
+            &spec_spare.default_view,
+            &diffuse_spare.default_view,
+            &resources.spec_moments[write as usize].default_view,
+        ),
+    ];
+
+    let mut stream_outputs = Vec::new();
+    for (pipelines_set, first_src, ping, pong, moments_view) in streams {
+        let mut last_dst: &TextureView = ping;
+        for (i, pipeline) in pipelines_set.iter().enumerate().take(iterations) {
+            let (src, dst): (&TextureView, &TextureView) = if i == 0 {
+                (first_src, ping)
+            } else if i % 2 == 1 {
+                (ping, pong)
+            } else {
+                (pong, ping)
+            };
+            let bind_group = render_device.create_bind_group(
+                "solari_denoise_atrous_bind_group",
+                &pipeline_cache.get_bind_group_layout(&pipelines.atrous_bind_group_layout),
+                &BindGroupEntries::sequential((
+                    src,
+                    dst,
+                    gbuffer,
+                    depth_buffer,
+                    moments_view,
+                    view_uniforms_binding.clone(),
+                    resources.params.as_entire_binding(),
+                    // spec_src is only used by the writeback entry point; bind a
+                    // texture that is never an à-trous dst to avoid usage conflicts.
+                    &resources.moments[read as usize].default_view,
+                )),
+            );
+            pass.set_bind_group(0, &bind_group, &[view_uniform_offset.offset]);
+            pass.set_pipeline(pipeline);
+            pass.dispatch_workgroups(dx, dy, 1);
+            last_dst = dst;
+        }
+        stream_outputs.push(last_dst);
     }
 
     let writeback_bind_group = render_device.create_bind_group(
         "solari_denoise_writeback_bind_group",
         &pipeline_cache.get_bind_group_layout(&pipelines.atrous_bind_group_layout),
         &BindGroupEntries::sequential((
-            last_dst,
+            stream_outputs[0],
             view_target.main_texture_view(),
             gbuffer,
             depth_buffer,
             &resources.moments[write as usize].default_view,
             view_uniforms_binding.clone(),
             resources.params.as_entire_binding(),
+            stream_outputs[1],
         )),
     );
     pass.set_bind_group(0, &writeback_bind_group, &[view_uniform_offset.offset]);
@@ -232,6 +266,10 @@ pub fn init_denoise_pipelines(
                 texture_storage_2d(TextureFormat::Rgba16Float, StorageTextureAccess::WriteOnly),
                 uniform_buffer_sized(false, None),
                 sampler(SamplerBindingType::Filtering),
+                texture_2d(TextureSampleType::Float { filterable: true }),
+                texture_2d(TextureSampleType::Float { filterable: true }),
+                texture_storage_2d(TextureFormat::Rgba16Float, StorageTextureAccess::WriteOnly),
+                texture_storage_2d(TextureFormat::Rgba16Float, StorageTextureAccess::WriteOnly),
             ),
         ),
     );
@@ -248,6 +286,8 @@ pub fn init_denoise_pipelines(
                 texture_2d(TextureSampleType::Float { filterable: false }),
                 uniform_buffer::<ViewUniform>(true),
                 uniform_buffer_sized(false, None),
+                // Only used by the writeback entry point.
+                texture_2d(TextureSampleType::Float { filterable: false }),
             ),
         ),
     );
@@ -274,6 +314,16 @@ pub fn init_denoise_pipelines(
         })
     });
 
+    let spec_atrous_pipelines = ATROUS_STRIDES.map(|stride| {
+        pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+            label: Some(format!("solari_denoise_atrous_spec_{stride}_pipeline").into()),
+            layout: vec![atrous_bind_group_layout.clone()],
+            shader: atrous_shader.clone(),
+            entry_point: Some(format!("atrous_spec_{stride}").into()),
+            ..default()
+        })
+    });
+
     let writeback_pipeline = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
         label: Some("solari_denoise_writeback_pipeline".into()),
         layout: vec![atrous_bind_group_layout.clone()],
@@ -287,6 +337,7 @@ pub fn init_denoise_pipelines(
         atrous_bind_group_layout,
         temporal_pipeline,
         atrous_pipelines,
+        spec_atrous_pipelines,
         writeback_pipeline,
     });
 }

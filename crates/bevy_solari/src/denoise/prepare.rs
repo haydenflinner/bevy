@@ -22,8 +22,12 @@ use bevy_render::{
 /// `1 - index` is read as last frame's history. `filtered` is scratch for the à-trous passes.
 #[derive(Component)]
 pub struct ViewDenoiseResources {
+    /// Diffuse (demodulated) history and luma moments.
     pub history: [CachedTexture; 2],
     pub moments: [CachedTexture; 2],
+    /// Specular history and luma moments.
+    pub spec_history: [CachedTexture; 2],
+    pub spec_moments: [CachedTexture; 2],
     pub filtered: CachedTexture,
     pub params: Buffer,
     pub index: u32,
@@ -102,6 +106,14 @@ pub fn prepare_svgf(
             moments: [
                 make("solari_denoise_moments_a", TextureFormat::Rgba16Float),
                 make("solari_denoise_moments_b", TextureFormat::Rgba16Float),
+            ],
+            spec_history: [
+                make("solari_denoise_spec_history_a", TextureFormat::Rgba16Float),
+                make("solari_denoise_spec_history_b", TextureFormat::Rgba16Float),
+            ],
+            spec_moments: [
+                make("solari_denoise_spec_moments_a", TextureFormat::Rgba16Float),
+                make("solari_denoise_spec_moments_b", TextureFormat::Rgba16Float),
             ],
             filtered: make("solari_denoise_filtered", TextureFormat::Rgba16Float),
             params: params_buffer,
