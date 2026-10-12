@@ -8,6 +8,7 @@
 
 extern crate alloc;
 
+pub mod denoise;
 pub mod pathtracer;
 pub mod realtime;
 pub mod scene;
@@ -43,6 +44,7 @@ impl PluginGroup for SolariPlugins {
         PluginGroupBuilder::start::<Self>()
             .add(RaytracingScenePlugin)
             .add(SolariLightingPlugin)
+            .add(denoise::SolariDenoisePlugin)
     }
 }
 

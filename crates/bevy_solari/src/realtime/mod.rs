@@ -1,5 +1,5 @@
 mod extract;
-mod node;
+pub(crate) mod node;
 mod prepare;
 
 use crate::{
@@ -244,18 +244,20 @@ impl Default for SolariLighting {
 }
 
 /// Adds or removes the prepass double-buffer components according to [`SolariLighting::restir`].
+/// [`Svgf`](crate::denoise::Svgf) also needs them for temporal reprojection.
 fn manage_prepass_double_buffers(
     views: Query<(
         Entity,
         &SolariLighting,
+        Has<crate::denoise::Svgf>,
         Has<DeferredPrepassDoubleBuffer>,
         Has<DepthPrepassDoubleBuffer>,
     )>,
     mut commands: Commands,
 ) {
-    for (entity, solari_lighting, deferred_double_buffered, depth_double_buffered) in &views {
+    for (entity, solari_lighting, svgf, deferred_double_buffered, depth_double_buffered) in &views {
         let mut entity = commands.entity(entity);
-        if solari_lighting.restir {
+        if solari_lighting.restir || svgf {
             if !deferred_double_buffered {
                 entity.insert(DeferredPrepassDoubleBuffer);
             }

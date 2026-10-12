@@ -12,6 +12,7 @@ use bevy::{
     prelude::*,
     render::{diagnostic::RenderDiagnosticsPlugin, render_resource::TextureUsages},
     solari::{
+        denoise::Svgf,
         pathtracer::{Pathtracer, PathtracingPlugin},
         prelude::{RaytracingMesh3d, SolariLighting, SolariPlugins},
     },
@@ -161,6 +162,7 @@ fn setup_pica_pica(
         camera.insert(Pathtracer::default());
     } else {
         camera.insert(SolariLighting::default());
+        camera.insert(Svgf::default());
     }
 
     // Using DLSS Ray Reconstruction for denoising (and cheaper rendering via upscaling) is _highly_ recommended when using Solari
@@ -342,6 +344,7 @@ fn setup_many_lights(
         camera.insert(Pathtracer::default());
     } else {
         camera.insert(SolariLighting::default());
+        camera.insert(Svgf::default());
     }
 
     // Using DLSS Ray Reconstruction for denoising (and cheaper rendering via upscaling) is _highly_ recommended when using Solari
@@ -619,8 +622,7 @@ fn update_control_text(
     }
 
     #[cfg(any(not(feature = "dlss"), feature = "force_disable_dlss"))]
-    text.0
-        .push_str("\nDenoising: App not compiled with DLSS support");
+    text.0.push_str("\nDenoising: SVGF (DLSS not compiled)");
 
     if solari_lighting.restir {
         text.0.push_str("\n(R): Disable ReSTIR");
