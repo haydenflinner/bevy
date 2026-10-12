@@ -32,6 +32,10 @@ struct InitialSamplingResult {
     /// lobe at x1 by first-bounce BRDF evaluation. `radiance` still holds the
     /// total; the two overlap, they do not partition.
     specular_radiance: vec3<f32>,
+    /// Travel distance of the bounce-0 BRDF ray — the virtual hit distance used
+    /// to reproject the specular stream along the reflection ray. 0 when the
+    /// bounce-0 ray was never traced.
+    x1_hit_t: f32,
 }
 
 /// Path vertices use the following convention: x0 = camera, x1 = primary ray hit (the G-buffer
@@ -57,9 +61,11 @@ struct PathState {
     /// specular lobe at x1, using the BRDF evaluated at the direction the
     /// contribution's energy actually arrived from.
     specular_radiance: vec3<f32>,
-    /// specular_brdf / brdf at x1 for the first BRDF-sampled direction, the share
-    /// of every x1-carrying contribution that belongs to the specular stream.
+    /// `specular_energy_fraction` at x1 — the share of every x1-carrying
+    /// contribution that belongs to the specular stream.
     x1_spec_fraction: vec3<f32>,
+    /// Travel distance of the bounce-0 BRDF ray, for specular reprojection.
+    x1_hit_t: f32,
     @if(RESTIR) reservoir: Reservoir,
     @if(RESTIR) weight_sum: f32,
     @if(RESTIR) selected_target_function: f32,
@@ -75,6 +81,7 @@ fn new_path_state(world_position: vec3<f32>, world_normal: vec3<f32>, wo: vec3<f
     path.radiance = vec3(0.0);
     path.specular_radiance = vec3(0.0);
     path.x1_spec_fraction = vec3(0.0);
+    path.x1_hit_t = 0.0;
     @if(RESTIR) {
         path.x1_brdf = vec3(0.0);
         path.x2_position = vec3(0.0);
@@ -118,6 +125,9 @@ fn generate_initial_path(world_position: vec3<f32>, world_normal: vec3<f32>, mat
         }
 
         let ray = trace_ray(path.ray_origin, next_bounce.wi, RAY_T_MIN, RAY_T_MAX, RAY_FLAG_NONE);
+        if bounce == 0u {
+            path.x1_hit_t = select(ray.t, RAY_T_MAX, ray.kind == RAY_QUERY_INTERSECTION_NONE);
+        }
 
         if ray.kind == RAY_QUERY_INTERSECTION_NONE {
             @if(DLSS_RR_GUIDE_BUFFERS)
@@ -217,6 +227,7 @@ fn generate_initial_path(world_position: vec3<f32>, world_normal: vec3<f32>, mat
     var result: InitialSamplingResult;
     result.radiance = path.radiance;
     result.specular_radiance = path.specular_radiance;
+    result.x1_hit_t = path.x1_hit_t;
     @if(RESTIR) {
         if path.selected_target_function > 0.0 {
             path.reservoir.unbiased_contribution_weight = path.weight_sum / path.selected_target_function;

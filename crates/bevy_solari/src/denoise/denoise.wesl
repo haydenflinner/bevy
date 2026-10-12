@@ -89,12 +89,13 @@ fn temporal(@builtin(global_invocation_id) global_id: vec3<u32>) {
     var surface: ResolvedGPixel;
     var w_spec = 0.0;
     var demod = 1.0;
+    var wo = vec3(0.0);
     if depth != 0.0 {
         surface = gpixel_resolve(gpixel, depth, pixel_id, size, view.world_from_clip);
         let m = surface.material;
+        wo = normalize(view.world_position - surface.world_position);
         demod = max(luma(calculate_diffuse_color(m.base_color, m.metallic, 0.0, 0.0)), 0.05);
         if params.use_aov < 0.5 {
-            let wo = normalize(view.world_position - surface.world_position);
             let F0 = calculate_F0(m.base_color, m.metallic, vec3(m.reflectance));
             w_spec = saturate(luma(env_brdf_approx2(F0, m.roughness, surface.world_normal, wo)));
         }
@@ -179,6 +180,30 @@ fn temporal(@builtin(global_invocation_id) global_id: vec3<u32>) {
     // Motion vectors are in UV units, pointing from the previous to the current frame.
     let mv = textureLoad(motion_vectors, pixel_id, 0).xy;
     let prev_uv = (vec2f(pixel_id) + 0.5) / size - mv;
+
+    // The specular stream reprojects through the *virtual* position of the
+    // reflected hit — specular reflections move with the reflected scene, not
+    // the surface's motion vector. `spec_aov` carries the bounce-0 ray's hit
+    // distance in alpha (independent of `use_aov`); a miss distance reprojects
+    // the reflection at infinity.
+    var spec_uv = prev_uv;
+    var hit_t = 0.0;
+    var virtual_pos = vec3(0.0);
+    if depth != 0.0 {
+        hit_t = min(textureLoad(spec_aov, pixel_id, 0).a, 1000.0);
+        if hit_t > 0.0 {
+            let refl_dir = reflect(-wo, surface.world_normal);
+            virtual_pos = surface.world_position + refl_dir * hit_t;
+            let prev_clip = previous_view.unjittered_clip_from_world * vec4(virtual_pos, 1.0);
+            if prev_clip.w > 0.0 {
+                let vuv = prev_clip.xy / prev_clip.w * vec2(0.5, -0.5) + 0.5;
+                if all(vuv >= vec2(0.0)) && all(vuv < vec2(1.0)) {
+                    spec_uv = vuv;
+                }
+            }
+        }
+    }
+
     if all(prev_uv >= vec2(0.0)) && all(prev_uv < vec2(1.0)) {
         let prev_pixel_id = vec2<u32>(prev_uv * size);
         let prev_depth = textureLoad(previous_depth_buffer, prev_pixel_id, 0);
@@ -204,20 +229,46 @@ fn temporal(@builtin(global_invocation_id) global_id: vec3<u32>) {
             let clip_hi_s = (nmean + 1.5 * nstd + vec3(0.001)) * f_spec;
 
             let sd = textureSampleLevel(history_color_in, history_sampler, prev_uv, 0.0);
-            let ss = textureSampleLevel(spec_history_in, history_sampler, prev_uv, 0.0);
             diff_color = clamp(sd.rgb, clip_lo_d, clip_hi_d);
-            spec_color = clamp(ss.rgb, clip_lo_s, clip_hi_s);
             diff_len = sd.a;
-            spec_len = ss.a;
             diff_moments = textureSampleLevel(history_moments_in, history_sampler, prev_uv, 0.0).rg;
-            spec_moments = textureSampleLevel(spec_moments_in, history_sampler, prev_uv, 0.0).rg;
+
+            // The specular reprojection lands on a different pixel than the
+            // surface's — validate the virtual hit against the geometry that
+            // was actually there last frame. Depth 0 is the far plane, so an
+            // environment-miss reflection only validates against sky.
+            var spec_valid = true;
+            if hit_t > 0.0 && distance(spec_uv * size, prev_uv * size) > 1.5 {
+                let spec_prev_px = vec2u(spec_uv * size);
+                let spec_prev_depth = textureLoad(previous_depth_buffer, spec_prev_px, 0);
+                if hit_t >= 999.0 {
+                    spec_valid = spec_prev_depth == 0.0;
+                } else if spec_prev_depth == 0.0 {
+                    spec_valid = false;
+                } else {
+                    let ndc = vec3(
+                        spec_uv * vec2(2.0, -2.0) + vec2(-1.0, 1.0), spec_prev_depth);
+                    let wpos = previous_view.world_from_clip * vec4(ndc, 1.0);
+                    spec_valid = distance(wpos.xyz / wpos.w, virtual_pos)
+                        < max(hit_t * 0.1, 0.05);
+                }
+            }
+            if spec_valid {
+                let ss = textureSampleLevel(spec_history_in, history_sampler, spec_uv, 0.0);
+                spec_color = clamp(ss.rgb, clip_lo_s, clip_hi_s);
+                spec_len = ss.a;
+                spec_moments = textureSampleLevel(spec_moments_in, history_sampler, spec_uv, 0.0).rg;
+            } else {
+                spec_len = min(
+                    textureSampleLevel(spec_history_in, history_sampler, spec_uv, 0.0).a, 8.0);
+            }
         } else {
             // Rejected history: keep a short tail instead of fully resetting, so
             // pixels whose validation flickers don't turn into raw 1spp noise.
             diff_len = min(
                 textureSampleLevel(history_color_in, history_sampler, prev_uv, 0.0).a, 8.0);
             spec_len = min(
-                textureSampleLevel(spec_history_in, history_sampler, prev_uv, 0.0).a, 8.0);
+                textureSampleLevel(spec_history_in, history_sampler, spec_uv, 0.0).a, 8.0);
         }
     }
 
@@ -225,8 +276,22 @@ fn temporal(@builtin(global_invocation_id) global_id: vec3<u32>) {
     // ghosts faster under motion than diffuse.
     let new_diff_len = min(diff_len + 1.0, params.max_history);
     let new_spec_len = min(spec_len + 1.0, params.max_history * 0.5);
-    let diff_alpha = 1.0 / new_diff_len;
-    let spec_alpha = 1.0 / new_spec_len;
+
+    // Adaptive alpha: the new sample's deviation from the history mean, in units
+    // of total expected noise — history variance *plus* the current frame's own
+    // input noise (neighborhood std scaled into each stream's units). Without
+    // the input term, converged history has near-zero variance and every
+    // ordinary noisy sample looks like a signal change, collapsing alpha to ~1.
+    // Only deviation beyond what noise explains shrinks the effective length,
+    // so the estimate tracks real scene changes instead of smearing.
+    let var_d = max(diff_moments.y - diff_moments.x * diff_moments.x, 0.0);
+    let var_s = max(spec_moments.y - spec_moments.x * spec_moments.x, 0.0);
+    let dev_d = abs(l_diff - diff_moments.x) / (sqrt(var_d) + lstd * sf_diff + 0.001);
+    let dev_s = abs(l_spec - spec_moments.x) / (sqrt(var_s) + lstd * sf_spec + 0.001);
+    let eff_diff_len = new_diff_len / max(dev_d * 0.5, 1.0);
+    let eff_spec_len = new_spec_len / max(dev_s * 0.5, 1.0);
+    let diff_alpha = 1.0 / eff_diff_len;
+    let spec_alpha = 1.0 / eff_spec_len;
 
     textureStore(
         history_color_out, pixel_id,

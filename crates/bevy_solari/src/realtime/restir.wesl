@@ -32,7 +32,7 @@ fn initial_and_temporal(@builtin(workgroup_id) workgroup_id: vec3<u32>, @builtin
 
     let initial = generate_initial_path(surface.world_position, surface.world_normal, surface.material, workgroup_id.xy, global_id.xy, &rng);
     textureStore(view_output, global_id.xy, vec4(initial.radiance, 0.0));
-    textureStore(specular_radiance_out, global_id.xy, vec4(initial.specular_radiance, 0.0));
+    textureStore(specular_radiance_out, global_id.xy, vec4(initial.specular_radiance, initial.x1_hit_t));
 
     let temporal = load_temporal_reservoir(global_id.xy, depth, surface.world_position, surface.world_normal);
     let previous_camera_homogeneous = previous_view.world_from_clip * (previous_view.clip_from_view * vec4(0.0, 0.0, 0.0, 1.0));
@@ -76,9 +76,10 @@ fn spatial_and_shade(@builtin(global_invocation_id) global_id: vec3<u32>) {
     // plus specular leftovers shaded directly in the initial pass.
     var specular_color = merge_result.selected_sample_specular_radiance * weight;
     specular_color += surface.material.emissive;
-    specular_color += textureLoad(specular_radiance_out, global_id.xy).rgb;
+    let specular_leftover = textureLoad(specular_radiance_out, global_id.xy);
+    specular_color += specular_leftover.rgb;
     specular_color *= view.exposure;
-    textureStore(specular_radiance_out, global_id.xy, vec4(specular_color, 1.0));
+    textureStore(specular_radiance_out, global_id.xy, vec4(specular_color, specular_leftover.a));
 
     @if(VISUALIZE_WORLD_CACHE)
     textureStore(view_output, global_id.xy, vec4(query_world_cache(surface.world_position, surface.world_normal, view.world_position, RAY_T_MAX, WORLD_CACHE_CELL_LIFETIME, &rng) * view.exposure, 1.0));

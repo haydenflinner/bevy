@@ -30,7 +30,7 @@ fn initial_and_shade(@builtin(workgroup_id) workgroup_id: vec3<u32>, @builtin(gl
 
     // Specular AOV: the specular-lobe share of path radiance plus the primary
     // surface's emissive (unmodulated light, it belongs in the unmodulated stream).
-    textureStore(specular_radiance_out, global_id.xy, vec4((path.specular_radiance + surface.material.emissive) * view.exposure, 1.0));
+    textureStore(specular_radiance_out, global_id.xy, vec4((path.specular_radiance + surface.material.emissive) * view.exposure, path.x1_hit_t));
 
     @if(VISUALIZE_WORLD_CACHE)
     textureStore(view_output, global_id.xy, vec4(query_world_cache(surface.world_position, surface.world_normal, view.world_position, RAY_T_MAX, WORLD_CACHE_CELL_LIFETIME, &rng) * view.exposure, 1.0));
