@@ -10,7 +10,9 @@ import package::scene::bindings::{light_sources, MIRROR_ROUGHNESS_THRESHOLD, RAY
 import package::realtime::world_cache_query::{get_cell_size, query_world_cache, WORLD_CACHE_CELL_LIFETIME};
 
 @if(DLSS_RR_GUIDE_BUFFERS)
-import package::realtime::resolve_dlss_rr_textures::{is_delta_mirror, primary_surface_glossy, psr_bounce_reflectance, psr_chain_mirror, psr_environment_miss, psr_init, replace_primary_surface};
+import package::realtime::psr::{is_delta_mirror, primary_surface_glossy, psr_bounce_reflectance, psr_chain_mirror, psr_init};
+@if(DLSS_RR_GUIDE_BUFFERS)
+import package::realtime::resolve_dlss_rr_textures::{psr_environment_miss, replace_primary_surface};
 
 enable wgpu_ray_query;
 
