@@ -29,6 +29,12 @@ use bevy::{
     render::camera::{MipBias, TemporalJitter},
 };
 
+#[cfg(all(feature = "metalfx", target_vendor = "apple"))]
+use bevy::{
+    anti_alias::metalfx::{MetalFxRayReconstruction, MetalFxRayReconstructionSupported},
+    render::camera::TemporalJitter,
+};
+
 /// `bevy_solari` demo.
 #[derive(FromArgs, Resource, Clone, Copy)]
 struct Args {
@@ -69,6 +75,8 @@ fn main() {
     } else {
         #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
         app.add_systems(Update, toggle_dlss_rr);
+        #[cfg(all(feature = "metalfx", target_vendor = "apple"))]
+        app.add_systems(Update, toggle_metalfx_rr);
 
         app.add_systems(Update, toggle_restir);
 
@@ -87,6 +95,9 @@ fn setup_pica_pica(
     args: Res<Args>,
     #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))] dlss_rr_supported: Option<
         Res<DlssRayReconstructionSupported>,
+    >,
+    #[cfg(all(feature = "metalfx", target_vendor = "apple"))] metalfx_rr_supported: Option<
+        Res<MetalFxRayReconstructionSupported>,
     >,
 ) {
     commands
@@ -169,6 +180,12 @@ fn setup_pica_pica(
         camera.insert(Dlss::<DlssRayReconstructionFeature>::default());
     }
 
+    // MetalFX Ray Reconstruction is the Apple-silicon equivalent of DLSS-RR
+    #[cfg(all(feature = "metalfx", target_vendor = "apple"))]
+    if metalfx_rr_supported.is_some() {
+        camera.insert(MetalFxRayReconstruction::default());
+    }
+
     commands.spawn((
         ControlText,
         Text::default(),
@@ -208,6 +225,9 @@ fn setup_many_lights(
     args: Res<Args>,
     #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))] dlss_rr_supported: Option<
         Res<DlssRayReconstructionSupported>,
+    >,
+    #[cfg(all(feature = "metalfx", target_vendor = "apple"))] metalfx_rr_supported: Option<
+        Res<MetalFxRayReconstructionSupported>,
     >,
 ) {
     let mut rng = ChaCha8Rng::seed_from_u64(42);
@@ -350,6 +370,12 @@ fn setup_many_lights(
         camera.insert(Dlss::<DlssRayReconstructionFeature>::default());
     }
 
+    // MetalFX Ray Reconstruction is the Apple-silicon equivalent of DLSS-RR
+    #[cfg(all(feature = "metalfx", target_vendor = "apple"))]
+    if metalfx_rr_supported.is_some() {
+        camera.insert(MetalFxRayReconstruction::default());
+    }
+
     commands.spawn((
         ControlText,
         Text::default(),
@@ -474,6 +500,27 @@ fn toggle_dlss_rr(
     }
 }
 
+#[cfg(all(feature = "metalfx", target_vendor = "apple"))]
+fn toggle_metalfx_rr(
+    key_input: Res<ButtonInput<KeyCode>>,
+    camera: Single<(Entity, Has<MetalFxRayReconstruction>), With<SolariLighting>>,
+    metalfx_rr_supported: Option<Res<MetalFxRayReconstructionSupported>>,
+    mut commands: Commands,
+) {
+    if key_input.just_pressed(KeyCode::Digit4) && metalfx_rr_supported.is_some() {
+        let (entity, metalfx) = *camera;
+        if metalfx {
+            commands
+                .entity(entity)
+                .remove::<(MetalFxRayReconstruction, TemporalJitter)>();
+        } else {
+            commands
+                .entity(entity)
+                .insert(MetalFxRayReconstruction::default());
+        }
+    }
+}
+
 fn toggle_restir(
     key_input: Res<ButtonInput<KeyCode>>,
     mut solari_lighting: Single<&mut SolariLighting>,
@@ -580,6 +627,13 @@ fn update_control_text(
         Has<Dlss<DlssRayReconstructionFeature>>,
         With<SolariLighting>,
     >,
+    #[cfg(all(feature = "metalfx", target_vendor = "apple"))] metalfx_rr_supported: Option<
+        Res<MetalFxRayReconstructionSupported>,
+    >,
+    #[cfg(all(feature = "metalfx", target_vendor = "apple"))] metalfx_camera: Query<
+        Has<MetalFxRayReconstruction>,
+        With<SolariLighting>,
+    >,
 ) {
     text.0.clear();
 
@@ -616,6 +670,19 @@ fn update_control_text(
     } else {
         text.0
             .push_str("\nDenoising: DLSS Ray Reconstruction not supported");
+    }
+
+    #[cfg(all(feature = "metalfx", target_vendor = "apple"))]
+    if metalfx_rr_supported.is_some() {
+        if matches!(metalfx_camera.single(), Ok(true)) {
+            text.0
+                .push_str("\n(4): Disable MetalFX Ray Reconstruction");
+        } else {
+            text.0.push_str("\n(4): Enable MetalFX Ray Reconstruction");
+        }
+    } else {
+        text.0
+            .push_str("\nDenoising: MetalFX Ray Reconstruction not supported");
     }
 
     #[cfg(any(not(feature = "dlss"), feature = "force_disable_dlss"))]
