@@ -5,6 +5,8 @@ use super::prepare::{
 use crate::scene::RaytracingSceneBindings;
 #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
 use bevy_anti_alias::dlss::ViewDlssRayReconstructionTextures;
+#[cfg(all(feature = "metalfx", target_vendor = "apple"))]
+use bevy_anti_alias::metalfx::ViewMetalFxRayReconstructionTextures;
 use bevy_asset::{load_embedded_asset, AssetServer, Handle};
 use bevy_core_pipeline::prepass::{
     PreviousViewData, PreviousViewUniformOffset, PreviousViewUniforms, ViewPrepassTextures,
@@ -37,6 +39,8 @@ pub struct SolariLightingPipelines {
     bind_group_layout_world_cache_active_cells_dispatch: BindGroupLayoutDescriptor,
     #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
     bind_group_layout_resolve_dlss_rr_textures: BindGroupLayoutDescriptor,
+    #[cfg(all(feature = "metalfx", target_vendor = "apple"))]
+    bind_group_layout_resolve_metalfx_rr_textures: BindGroupLayoutDescriptor,
     decay_world_cache_pipeline: CachedComputePipelineId,
     compact_world_cache_single_block_pipeline: CachedComputePipelineId,
     compact_world_cache_blocks_pipeline: CachedComputePipelineId,
@@ -49,12 +53,16 @@ pub struct SolariLightingPipelines {
     no_restir: NoRestirPipelines,
     #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
     resolve_dlss_rr_textures_pipeline: CachedComputePipelineId,
+    #[cfg(all(feature = "metalfx", target_vendor = "apple"))]
+    resolve_metalfx_rr_textures_pipeline: CachedComputePipelineId,
 }
 
 struct RestirPipelines {
     initial_and_temporal: CachedComputePipelineId,
     #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
     initial_and_temporal_with_psr: CachedComputePipelineId,
+    #[cfg(all(feature = "metalfx", target_vendor = "apple"))]
+    initial_and_temporal_with_psr_metalfx: CachedComputePipelineId,
     spatial_and_shade: CachedComputePipelineId,
 }
 
@@ -62,6 +70,8 @@ struct NoRestirPipelines {
     initial_and_shade: CachedComputePipelineId,
     #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
     initial_and_shade_with_psr: CachedComputePipelineId,
+    #[cfg(all(feature = "metalfx", target_vendor = "apple"))]
+    initial_and_shade_with_psr_metalfx: CachedComputePipelineId,
 }
 
 #[cfg(any(not(feature = "dlss"), feature = "force_disable_dlss"))]
@@ -90,9 +100,14 @@ pub fn solari_lighting(
     scene_bindings: Res<RaytracingSceneBindings>,
     view_uniforms: Res<ViewUniforms>,
     previous_view_uniforms: Res<PreviousViewUniforms>,
+    #[cfg(all(feature = "metalfx", target_vendor = "apple"))]
+    metalfx_rr_textures: Query<&'static ViewMetalFxRayReconstructionTextures>,
     render_device: Res<RenderDevice>,
     mut ctx: RenderContext,
 ) {
+    #[cfg(all(feature = "metalfx", target_vendor = "apple"))]
+    let view_metalfx_rr_textures = metalfx_rr_textures.get(view.entity()).ok();
+
     #[cfg(any(not(feature = "dlss"), feature = "force_disable_dlss"))]
     let (
         solari_lighting_resources,
@@ -122,30 +137,79 @@ pub fn solari_lighting(
             .zip(view_prepass_textures.previous_depth_only_view()),
     );
 
-    #[cfg(any(not(feature = "dlss"), feature = "force_disable_dlss"))]
-    let (initial_pipeline_id, spatial_pipeline_id) = if restir.is_some() {
-        (
-            pipelines.restir.initial_and_temporal,
-            Some(pipelines.restir.spatial_and_shade),
-        )
-    } else {
-        (pipelines.no_restir.initial_and_shade, None)
+    #[cfg(any(
+        all(feature = "dlss", not(feature = "force_disable_dlss")),
+        all(feature = "metalfx", target_vendor = "apple")
+    ))]
+    #[derive(Clone, Copy)]
+    enum RrVendor {
+        #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
+        Dlss,
+        #[cfg(all(feature = "metalfx", target_vendor = "apple"))]
+        MetalFx,
+    }
+
+    // Vendor ray reconstruction gets priority over the vendor-neutral path, and DLSS over MetalFX
+    // when a view somehow has both.
+    #[cfg(any(
+        all(feature = "dlss", not(feature = "force_disable_dlss")),
+        all(feature = "metalfx", target_vendor = "apple")
+    ))]
+    let rr_vendor = {
+        #[allow(unused_mut)]
+        let mut vendor = None;
+        #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
+        if view_dlss_rr_textures.is_some() {
+            vendor = Some(RrVendor::Dlss);
+        }
+        #[cfg(all(feature = "metalfx", target_vendor = "apple"))]
+        if vendor.is_none() && view_metalfx_rr_textures.is_some() {
+            vendor = Some(RrVendor::MetalFx);
+        }
+        vendor
     };
 
     #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
-    let (initial_pipeline_id, spatial_pipeline_id) =
-        match (restir.is_some(), view_dlss_rr_textures.is_some()) {
-            (true, true) => (
-                pipelines.restir.initial_and_temporal_with_psr,
-                Some(pipelines.restir.spatial_and_shade),
-            ),
-            (true, false) => (
-                pipelines.restir.initial_and_temporal,
-                Some(pipelines.restir.spatial_and_shade),
-            ),
-            (false, true) => (pipelines.no_restir.initial_and_shade_with_psr, None),
-            (false, false) => (pipelines.no_restir.initial_and_shade, None),
+    let view_dlss_rr_textures = if matches!(rr_vendor, Some(RrVendor::Dlss)) {
+        view_dlss_rr_textures
+    } else {
+        None
+    };
+
+    #[cfg(all(feature = "metalfx", target_vendor = "apple"))]
+    let view_metalfx_rr_textures = if matches!(rr_vendor, Some(RrVendor::MetalFx)) {
+        view_metalfx_rr_textures
+    } else {
+        None
+    };
+
+    #[allow(unused_mut)]
+    let mut initial_pipeline_id = if restir.is_some() {
+        pipelines.restir.initial_and_temporal
+    } else {
+        pipelines.no_restir.initial_and_shade
+    };
+    #[cfg(any(
+        all(feature = "dlss", not(feature = "force_disable_dlss")),
+        all(feature = "metalfx", target_vendor = "apple")
+    ))]
+    #[allow(unreachable_patterns)]
+    if let Some(vendor) = rr_vendor {
+        initial_pipeline_id = match (restir.is_some(), vendor) {
+            #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
+            (true, RrVendor::Dlss) => pipelines.restir.initial_and_temporal_with_psr,
+            #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
+            (false, RrVendor::Dlss) => pipelines.no_restir.initial_and_shade_with_psr,
+            #[cfg(all(feature = "metalfx", target_vendor = "apple"))]
+            (true, RrVendor::MetalFx) => pipelines.restir.initial_and_temporal_with_psr_metalfx,
+            #[cfg(all(feature = "metalfx", target_vendor = "apple"))]
+            (false, RrVendor::MetalFx) => pipelines.no_restir.initial_and_shade_with_psr_metalfx,
+            (true, _) => pipelines.restir.initial_and_temporal,
+            (false, _) => pipelines.no_restir.initial_and_shade,
         };
+    }
+
+    let spatial_pipeline_id = restir.is_some().then_some(pipelines.restir.spatial_and_shade);
 
     let (
         Some(decay_world_cache_pipeline),
@@ -193,12 +257,28 @@ pub fn solari_lighting(
         None => None,
     };
 
-    #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
-    let Some(resolve_dlss_rr_textures_pipeline) =
-        pipeline_cache.get_compute_pipeline(pipelines.resolve_dlss_rr_textures_pipeline)
-    else {
-        return;
+    #[cfg(any(
+        all(feature = "dlss", not(feature = "force_disable_dlss")),
+        all(feature = "metalfx", target_vendor = "apple")
+    ))]
+    let resolve_rr_textures_pipeline = match rr_vendor {
+        #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
+        Some(RrVendor::Dlss) => {
+            pipeline_cache.get_compute_pipeline(pipelines.resolve_dlss_rr_textures_pipeline)
+        }
+        #[cfg(all(feature = "metalfx", target_vendor = "apple"))]
+        Some(RrVendor::MetalFx) => {
+            pipeline_cache.get_compute_pipeline(pipelines.resolve_metalfx_rr_textures_pipeline)
+        }
+        None => None,
     };
+    #[cfg(any(
+        all(feature = "dlss", not(feature = "force_disable_dlss")),
+        all(feature = "metalfx", target_vendor = "apple")
+    ))]
+    if rr_vendor.is_some() && resolve_rr_textures_pipeline.is_none() {
+        return;
+    }
 
     // Past every bail-out, so this view's reservoirs will be brought up to this frame's light ids
     if restir.is_some() {
@@ -272,6 +352,24 @@ pub fn solari_lighting(
         )
     });
 
+    #[cfg(all(feature = "metalfx", target_vendor = "apple"))]
+    let bind_group_resolve_metalfx_rr_textures = view_metalfx_rr_textures.map(|d| {
+        render_device.create_bind_group(
+            "solari_lighting_bind_group_resolve_metalfx_rr_textures",
+            &pipeline_cache.get_bind_group_layout(
+                &pipelines.bind_group_layout_resolve_metalfx_rr_textures,
+            ),
+            &BindGroupEntries::sequential((
+                &d.diffuse_albedo.default_view,
+                &d.specular_albedo.default_view,
+                &d.normal.default_view,
+                &d.roughness.default_view,
+                &d.depth.default_view,
+                &d.specular_hit_distance.default_view,
+            )),
+        )
+    });
+
     let diagnostics = ctx.diagnostic_recorder();
     let diagnostics = diagnostics.as_deref();
 
@@ -307,11 +405,26 @@ pub fn solari_lighting(
         ],
     );
 
-    #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
-    if let Some(bind_group_resolve_dlss_rr_textures) = &bind_group_resolve_dlss_rr_textures {
-        pass.set_bind_group(2, bind_group_resolve_dlss_rr_textures, &[]);
-        pass.set_pipeline(resolve_dlss_rr_textures_pipeline);
-        pass.dispatch_workgroups(dx, dy, 1);
+    #[cfg(any(
+        all(feature = "dlss", not(feature = "force_disable_dlss")),
+        all(feature = "metalfx", target_vendor = "apple")
+    ))]
+    {
+        #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
+        let bind_group_rr_textures = bind_group_resolve_dlss_rr_textures.as_ref();
+        #[cfg(not(all(feature = "dlss", not(feature = "force_disable_dlss"))))]
+        let bind_group_rr_textures = bind_group_resolve_metalfx_rr_textures.as_ref();
+        #[cfg(all(feature = "metalfx", target_vendor = "apple"))]
+        let bind_group_rr_textures =
+            bind_group_rr_textures.or(bind_group_resolve_metalfx_rr_textures.as_ref());
+
+        if let Some(bind_group_rr_textures) = bind_group_rr_textures {
+            pass.set_bind_group(2, bind_group_rr_textures, &[]);
+            pass.set_pipeline(
+                resolve_rr_textures_pipeline.expect("checked pipeline exists above"),
+            );
+            pass.dispatch_workgroups(dx, dy, 1);
+        }
     }
 
     let d = diagnostics.time_span(&mut pass, "solari_lighting/presample_light_tiles");
@@ -370,9 +483,22 @@ pub fn solari_lighting(
         );
     }
 
-    #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
-    if let Some(bind_group_resolve_dlss_rr_textures) = &bind_group_resolve_dlss_rr_textures {
-        pass.set_bind_group(2, bind_group_resolve_dlss_rr_textures, &[]);
+    #[cfg(any(
+        all(feature = "dlss", not(feature = "force_disable_dlss")),
+        all(feature = "metalfx", target_vendor = "apple")
+    ))]
+    {
+        #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
+        let bind_group_rr_textures = bind_group_resolve_dlss_rr_textures.as_ref();
+        #[cfg(not(all(feature = "dlss", not(feature = "force_disable_dlss"))))]
+        let bind_group_rr_textures = bind_group_resolve_metalfx_rr_textures.as_ref();
+        #[cfg(all(feature = "metalfx", target_vendor = "apple"))]
+        let bind_group_rr_textures =
+            bind_group_rr_textures.or(bind_group_resolve_metalfx_rr_textures.as_ref());
+
+        if let Some(bind_group_rr_textures) = bind_group_rr_textures {
+            pass.set_bind_group(2, bind_group_rr_textures, &[]);
+        }
     }
     pass.set_pipeline(initial_pipeline);
     pass.dispatch_workgroups(dx, dy, 1);
@@ -477,6 +603,22 @@ pub fn init_solari_lighting_pipelines(
         ),
     );
 
+    #[cfg(all(feature = "metalfx", target_vendor = "apple"))]
+    let bind_group_layout_resolve_metalfx_rr_textures = BindGroupLayoutDescriptor::new(
+        "solari_lighting_bind_group_layout_resolve_metalfx_rr_textures",
+        &BindGroupLayoutEntries::sequential(
+            ShaderStages::COMPUTE,
+            (
+                texture_storage_2d(TextureFormat::Rgba8Unorm, StorageTextureAccess::WriteOnly),
+                texture_storage_2d(TextureFormat::Rgba8Unorm, StorageTextureAccess::WriteOnly),
+                texture_storage_2d(TextureFormat::Rgba16Float, StorageTextureAccess::WriteOnly),
+                texture_storage_2d(TextureFormat::R8Unorm, StorageTextureAccess::WriteOnly),
+                texture_storage_2d(TextureFormat::R32Float, StorageTextureAccess::WriteOnly),
+                texture_storage_2d(TextureFormat::R32Float, StorageTextureAccess::WriteOnly),
+            ),
+        ),
+    );
+
     let create_pipeline = |label: &'static str,
                            entry_point: &'static str,
                            shader: Handle<Shader>,
@@ -497,6 +639,10 @@ pub fn init_solari_lighting_pipelines(
             #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
             ExtraBindGroup::DlssRrGuideBuffers => {
                 layout.push(bind_group_layout_resolve_dlss_rr_textures.clone());
+            }
+            #[cfg(all(feature = "metalfx", target_vendor = "apple"))]
+            ExtraBindGroup::MetalFxRrGuideBuffers => {
+                layout.push(bind_group_layout_resolve_metalfx_rr_textures.clone());
             }
         }
 
@@ -519,6 +665,10 @@ pub fn init_solari_lighting_pipelines(
             ExtraBindGroup::DlssRrGuideBuffers => {
                 shader_defs.push("DLSS_RR_GUIDE_BUFFERS".into());
             }
+            #[cfg(all(feature = "metalfx", target_vendor = "apple"))]
+            ExtraBindGroup::MetalFxRrGuideBuffers => {
+                shader_defs.push("METALFX_RR_GUIDE_BUFFERS".into());
+            }
         }
         shader_defs.extend_from_slice(&extra_shader_defs);
 
@@ -540,6 +690,9 @@ pub fn init_solari_lighting_pipelines(
         #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
         bind_group_layout_resolve_dlss_rr_textures: bind_group_layout_resolve_dlss_rr_textures
             .clone(),
+        #[cfg(all(feature = "metalfx", target_vendor = "apple"))]
+        bind_group_layout_resolve_metalfx_rr_textures:
+            bind_group_layout_resolve_metalfx_rr_textures.clone(),
         decay_world_cache_pipeline: create_pipeline(
             "solari_lighting_decay_world_cache_pipeline",
             "decay_world_cache",
@@ -622,6 +775,15 @@ pub fn init_solari_lighting_pipelines(
                 ExtraBindGroup::DlssRrGuideBuffers,
                 vec![],
             ),
+            #[cfg(all(feature = "metalfx", target_vendor = "apple"))]
+            initial_and_temporal_with_psr_metalfx: create_pipeline(
+                "solari_lighting_initial_and_temporal_with_psr_metalfx_pipeline",
+                "initial_and_temporal",
+                load_embedded_asset!(asset_server.as_ref(), "restir.wesl"),
+                true,
+                ExtraBindGroup::MetalFxRrGuideBuffers,
+                vec![],
+            ),
             spatial_and_shade: create_pipeline(
                 "solari_lighting_spatial_and_shade_pipeline",
                 "spatial_and_shade",
@@ -649,6 +811,15 @@ pub fn init_solari_lighting_pipelines(
                 ExtraBindGroup::DlssRrGuideBuffers,
                 vec![],
             ),
+            #[cfg(all(feature = "metalfx", target_vendor = "apple"))]
+            initial_and_shade_with_psr_metalfx: create_pipeline(
+                "solari_lighting_initial_and_shade_with_psr_metalfx_pipeline",
+                "initial_and_shade",
+                load_embedded_asset!(asset_server.as_ref(), "no_restir.wesl"),
+                false,
+                ExtraBindGroup::MetalFxRrGuideBuffers,
+                vec![],
+            ),
         },
         #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
         resolve_dlss_rr_textures_pipeline: create_pipeline(
@@ -659,6 +830,15 @@ pub fn init_solari_lighting_pipelines(
             ExtraBindGroup::DlssRrGuideBuffers,
             vec![],
         ),
+        #[cfg(all(feature = "metalfx", target_vendor = "apple"))]
+        resolve_metalfx_rr_textures_pipeline: create_pipeline(
+            "solari_lighting_resolve_metalfx_rr_textures_pipeline",
+            "resolve_metalfx_rr_textures",
+            load_embedded_asset!(asset_server.as_ref(), "resolve_metalfx_rr_textures.wesl"),
+            false,
+            ExtraBindGroup::MetalFxRrGuideBuffers,
+            vec![],
+        ),
     });
 }
 
@@ -667,4 +847,6 @@ enum ExtraBindGroup {
     WorldCacheDispatch,
     #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
     DlssRrGuideBuffers,
+    #[cfg(all(feature = "metalfx", target_vendor = "apple"))]
+    MetalFxRrGuideBuffers,
 }

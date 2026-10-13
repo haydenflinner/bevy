@@ -4,16 +4,26 @@ use crate::scene::RaytracingSceneNeedsPreviousFrameData;
 use bevy_anti_alias::dlss::{
     Dlss, DlssRayReconstructionFeature, ViewDlssRayReconstructionTextures,
 };
+#[cfg(all(feature = "metalfx", target_vendor = "apple"))]
+use bevy_anti_alias::metalfx::{MetalFxRayReconstruction, ViewMetalFxRayReconstructionTextures};
 use bevy_camera::MainPassResolutionOverride;
 use bevy_diagnostic::FrameCount;
-#[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
+#[cfg(any(
+    all(feature = "dlss", not(feature = "force_disable_dlss")),
+    all(feature = "metalfx", target_vendor = "apple")
+))]
 use bevy_ecs::query::Has;
+#[cfg(all(feature = "metalfx", target_vendor = "apple"))]
+use bevy_ecs::query::With;
 use bevy_ecs::{
     component::Component,
     entity::Entity,
     system::{Commands, Query, Res},
 };
-#[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
+#[cfg(any(
+    all(feature = "dlss", not(feature = "force_disable_dlss")),
+    all(feature = "metalfx", target_vendor = "apple")
+))]
 use bevy_image::ToExtents;
 use bevy_math::UVec2;
 use bevy_render::{
@@ -21,7 +31,10 @@ use bevy_render::{
     render_resource::{Buffer, BufferDescriptor, BufferInitDescriptor, BufferUsages},
     renderer::{RenderDevice, RenderQueue},
 };
-#[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
+#[cfg(any(
+    all(feature = "dlss", not(feature = "force_disable_dlss")),
+    all(feature = "metalfx", target_vendor = "apple")
+))]
 use bevy_render::{
     render_resource::{
         TextureDescriptor, TextureDimension, TextureFormat, TextureUsages, TextureViewDescriptor,
@@ -143,6 +156,10 @@ pub fn prepare_solari_lighting_resources(
         Option<&MainPassResolutionOverride>,
         Has<Dlss<DlssRayReconstructionFeature>>,
     )>,
+    #[cfg(all(feature = "metalfx", target_vendor = "apple"))] metalfx_rr_query: Query<
+        Has<ViewMetalFxRayReconstructionTextures>,
+        With<MetalFxRayReconstruction>,
+    >,
     render_device: Res<RenderDevice>,
     render_queue: Res<RenderQueue>,
     frame_count: Res<FrameCount>,
@@ -167,6 +184,59 @@ pub fn prepare_solari_lighting_resources(
         };
         if let Some(MainPassResolutionOverride(resolution_override)) = resolution_override {
             view_size = *resolution_override;
+        }
+
+        // Extraction removes the MetalFX guide textures when `MetalFxRayReconstruction` is
+        // removed, so create them whenever they are missing. Do not tie this to the reuse
+        // check below.
+        #[cfg(all(feature = "metalfx", target_vendor = "apple"))]
+        if metalfx_rr_query.get(entity) == Ok(false) {
+            let rr_texture = |label, format| {
+                let texture = render_device.create_texture(&TextureDescriptor {
+                    label: Some(label),
+                    size: view_size.to_extents(),
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: TextureDimension::D2,
+                    format,
+                    usage: TextureUsages::TEXTURE_BINDING | TextureUsages::STORAGE_BINDING,
+                    view_formats: &[],
+                });
+                let default_view = texture.create_view(&TextureViewDescriptor::default());
+                CachedTexture {
+                    texture,
+                    default_view,
+                }
+            };
+
+            commands
+                .entity(entity)
+                .insert(ViewMetalFxRayReconstructionTextures {
+                    diffuse_albedo: rr_texture(
+                        "solari_lighting_metalfx_diffuse_albedo",
+                        TextureFormat::Rgba8Unorm,
+                    ),
+                    specular_albedo: rr_texture(
+                        "solari_lighting_metalfx_specular_albedo",
+                        TextureFormat::Rgba8Unorm,
+                    ),
+                    normal: rr_texture(
+                        "solari_lighting_metalfx_normal",
+                        TextureFormat::Rgba16Float,
+                    ),
+                    roughness: rr_texture(
+                        "solari_lighting_metalfx_roughness",
+                        TextureFormat::R8Unorm,
+                    ),
+                    depth: rr_texture(
+                        "solari_lighting_metalfx_depth",
+                        TextureFormat::R32Float,
+                    ),
+                    specular_hit_distance: rr_texture(
+                        "solari_lighting_metalfx_specular_hit_distance",
+                        TextureFormat::R32Float,
+                    ),
+                });
         }
 
         let reusable = solari_lighting_resources.filter(|r| {

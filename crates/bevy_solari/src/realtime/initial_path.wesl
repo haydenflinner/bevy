@@ -9,10 +9,14 @@ import package::scene::sampling::{calculate_resolved_light_contribution, isinf, 
 import package::scene::bindings::{light_sources, MIRROR_ROUGHNESS_THRESHOLD, RAY_T_MAX, RAY_T_MIN, resolve_ray_hit_full, ResolvedMaterial, ResolvedRayHitFull, trace_ray};
 import package::realtime::world_cache_query::{get_cell_size, query_world_cache, WORLD_CACHE_CELL_LIFETIME};
 
-@if(DLSS_RR_GUIDE_BUFFERS)
+@if(DLSS_RR_GUIDE_BUFFERS || METALFX_RR_GUIDE_BUFFERS)
 import package::realtime::psr::{is_delta_mirror, primary_surface_glossy, psr_bounce_reflectance, psr_chain_mirror, psr_init};
 @if(DLSS_RR_GUIDE_BUFFERS)
 import package::realtime::resolve_dlss_rr_textures::{psr_environment_miss, replace_primary_surface};
+@if(METALFX_RR_GUIDE_BUFFERS)
+import package::realtime::resolve_metalfx_rr_textures::{psr_environment_miss, replace_primary_surface};
+@if(METALFX_RR_GUIDE_BUFFERS)
+import package::realtime::bindings::specular_hit_distance;
 
 enable wgpu_ray_query;
 
@@ -51,6 +55,8 @@ struct PathState {
     @if(RESTIR) x1_brdf: vec3<f32>,
     /// Radiance shaded directly at this pixel
     radiance: vec3<f32>,
+    /// Travel distance of the bounce-0 BRDF ray — the specular hit distance guide.
+    @if(METALFX_RR_GUIDE_BUFFERS) x1_hit_t: f32,
     @if(RESTIR) reservoir: Reservoir,
     @if(RESTIR) weight_sum: f32,
     @if(RESTIR) selected_target_function: f32,
@@ -64,6 +70,8 @@ fn new_path_state(world_position: vec3<f32>, world_normal: vec3<f32>, wo: vec3<f
     path.material = material;
     path.throughput_past_first_hit = vec3(1.0);
     path.radiance = vec3(0.0);
+    @if(METALFX_RR_GUIDE_BUFFERS)
+    path.x1_hit_t = 0.0;
     @if(RESTIR) {
         path.x1_brdf = vec3(0.0);
         path.x2_position = vec3(0.0);
@@ -84,7 +92,7 @@ fn generate_initial_path(world_position: vec3<f32>, world_normal: vec3<f32>, mat
 
     var path = new_path_state(world_position, world_normal, wo, material);
 
-    @if(DLSS_RR_GUIDE_BUFFERS)
+    @if(DLSS_RR_GUIDE_BUFFERS || METALFX_RR_GUIDE_BUFFERS)
     var psr = psr_init(world_normal, material);
 
     for (var bounce = 0u; bounce < constants.max_bounces; bounce++) {
@@ -100,8 +108,13 @@ fn generate_initial_path(world_position: vec3<f32>, world_normal: vec3<f32>, mat
         if next_bounce.pdf == 0.0 { break; }
         let ray = trace_ray(path.ray_origin, next_bounce.wi, RAY_T_MIN, RAY_T_MAX, RAY_FLAG_NONE);
 
+        @if(METALFX_RR_GUIDE_BUFFERS)
+        if bounce == 0u {
+            path.x1_hit_t = select(ray.t, RAY_T_MAX, ray.kind == RAY_QUERY_INTERSECTION_NONE);
+        }
+
         if ray.kind == RAY_QUERY_INTERSECTION_NONE {
-            @if(DLSS_RR_GUIDE_BUFFERS)
+            @if(DLSS_RR_GUIDE_BUFFERS || METALFX_RR_GUIDE_BUFFERS)
             if !psr.finished && !next_bounce.diffuse_selected {
                 psr_environment_miss(pixel_id, wo);
             }
@@ -119,7 +132,7 @@ fn generate_initial_path(world_position: vec3<f32>, world_normal: vec3<f32>, mat
         let ray_hit = resolve_ray_hit_full(ray);
         let p_brdf = next_bounce.pdf;
 
-        @if(DLSS_RR_GUIDE_BUFFERS)
+        @if(DLSS_RR_GUIDE_BUFFERS || METALFX_RR_GUIDE_BUFFERS)
         if !psr.finished {
             if next_bounce.diffuse_selected {
                 // Took the non-specular lobe, so not a mirror reflection. Keep the guide-buffer defaults.
@@ -192,6 +205,12 @@ fn generate_initial_path(world_position: vec3<f32>, world_normal: vec3<f32>, mat
             path.throughput_past_first_hit /= rr;
         }
     }
+
+    @if(METALFX_RR_GUIDE_BUFFERS)
+    // MetalFX reprojects reflections off a specular hit distance. For a mirror chain the useful
+    // value is the distance accumulated along the whole chain, which `psr` tracked. Otherwise
+    // the bounce-0 ray's own distance is the best guide available.
+    textureStore(specular_hit_distance, pixel_id, vec4(max(path.x1_hit_t, psr.reflection_length), vec3(0.0)));
 
     var result: InitialSamplingResult;
     result.radiance = path.radiance;
