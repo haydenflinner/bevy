@@ -4,10 +4,17 @@ use crate::scene::RaytracingSceneNeedsPreviousFrameData;
 use bevy_anti_alias::dlss::{
     Dlss, DlssRayReconstructionFeature, ViewDlssRayReconstructionTextures,
 };
+#[cfg(all(feature = "metalfx", target_vendor = "apple"))]
+use bevy_anti_alias::metalfx::{MetalFxRayReconstruction, ViewMetalFxRayReconstructionTextures};
 use bevy_camera::MainPassResolutionOverride;
 use bevy_diagnostic::FrameCount;
-#[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
+#[cfg(any(
+    all(feature = "dlss", not(feature = "force_disable_dlss")),
+    all(feature = "metalfx", target_vendor = "apple")
+))]
 use bevy_ecs::query::Has;
+#[cfg(all(feature = "metalfx", target_vendor = "apple"))]
+use bevy_ecs::query::With;
 use bevy_ecs::{
     component::Component,
     entity::Entity,
@@ -142,6 +149,10 @@ pub fn prepare_solari_lighting_resources(
         Option<&MainPassResolutionOverride>,
         Has<Dlss<DlssRayReconstructionFeature>>,
     )>,
+    #[cfg(all(feature = "metalfx", target_vendor = "apple"))] metalfx_rr_query: Query<
+        Has<ViewMetalFxRayReconstructionTextures>,
+        With<MetalFxRayReconstruction>,
+    >,
     render_device: Res<RenderDevice>,
     render_queue: Res<RenderQueue>,
     frame_count: Res<FrameCount>,
@@ -166,6 +177,59 @@ pub fn prepare_solari_lighting_resources(
         };
         if let Some(MainPassResolutionOverride(resolution_override)) = resolution_override {
             view_size = *resolution_override;
+        }
+
+        // The MetalFX guide textures are removed by extraction when `MetalFxRayReconstruction`
+        // is removed, so they must be (re)created whenever they are missing, independently of
+        // whether the other lighting resources are reusable.
+        #[cfg(all(feature = "metalfx", target_vendor = "apple"))]
+        if metalfx_rr_query.get(entity) == Ok(false) {
+            let rr_texture = |label, format| {
+                let texture = render_device.create_texture(&TextureDescriptor {
+                    label: Some(label),
+                    size: view_size.to_extents(),
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: TextureDimension::D2,
+                    format,
+                    usage: TextureUsages::TEXTURE_BINDING | TextureUsages::STORAGE_BINDING,
+                    view_formats: &[],
+                });
+                let default_view = texture.create_view(&TextureViewDescriptor::default());
+                CachedTexture {
+                    texture,
+                    default_view,
+                }
+            };
+
+            commands
+                .entity(entity)
+                .insert(ViewMetalFxRayReconstructionTextures {
+                    diffuse_albedo: rr_texture(
+                        "solari_lighting_metalfx_diffuse_albedo",
+                        TextureFormat::Rgba8Unorm,
+                    ),
+                    specular_albedo: rr_texture(
+                        "solari_lighting_metalfx_specular_albedo",
+                        TextureFormat::Rgba8Unorm,
+                    ),
+                    normal: rr_texture(
+                        "solari_lighting_metalfx_normal",
+                        TextureFormat::Rgba16Float,
+                    ),
+                    roughness: rr_texture(
+                        "solari_lighting_metalfx_roughness",
+                        TextureFormat::R8Unorm,
+                    ),
+                    depth: rr_texture(
+                        "solari_lighting_metalfx_depth",
+                        TextureFormat::R32Float,
+                    ),
+                    specular_hit_distance: rr_texture(
+                        "solari_lighting_metalfx_specular_hit_distance",
+                        TextureFormat::R32Float,
+                    ),
+                });
         }
 
         let reusable = solari_lighting_resources.filter(|r| {
@@ -230,7 +294,8 @@ pub fn prepare_solari_lighting_resources(
 
         let world_cache_active_cells_dispatch = render_device.create_buffer(&BufferDescriptor {
             label: Some("solari_lighting_world_cache_active_cells_dispatch"),
-            size: size_of::<[u32; 3]>() as u64,
+            // The shader declares a vec3<u32>, which is 12 bytes but 16-byte aligned on Metal.
+            size: size_of::<[u32; 4]>() as u64,
             usage: BufferUsages::INDIRECT | BufferUsages::STORAGE,
             mapped_at_creation: false,
         });

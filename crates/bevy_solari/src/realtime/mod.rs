@@ -59,6 +59,7 @@ impl Plugin for SolariLightingPlugin {
         embedded_asset!(app, "world_cache_update.wesl");
 
         load_shader_library!(app, "resolve_dlss_rr_textures.wesl");
+        load_shader_library!(app, "resolve_metalfx_rr_textures.wesl");
 
         app.insert_resource(DefaultOpaqueRendererMethod::deferred());
     }

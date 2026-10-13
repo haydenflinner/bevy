@@ -1,5 +1,9 @@
 use super::{prepare::ViewDenoiseResources, Svgf};
 use crate::realtime::prepare::SolariLightingResources;
+#[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
+use bevy_anti_alias::dlss::{Dlss, DlssRayReconstructionFeature};
+#[cfg(all(feature = "metalfx", target_vendor = "apple"))]
+use bevy_anti_alias::metalfx::MetalFxRayReconstruction;
 use bevy_asset::{load_embedded_asset, AssetServer, Handle};
 use bevy_core_pipeline::prepass::{
     PreviousViewData, PreviousViewUniformOffset, PreviousViewUniforms, ViewPrepassTextures,
@@ -58,9 +62,33 @@ pub fn solari_denoise(
     pipeline_cache: Res<PipelineCache>,
     view_uniforms: Res<ViewUniforms>,
     previous_view_uniforms: Res<PreviousViewUniforms>,
+    #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))] dlss_rr: Query<
+        (),
+        With<Dlss<DlssRayReconstructionFeature>>,
+    >,
+    #[cfg(all(feature = "metalfx", target_vendor = "apple"))] metalfx_rr: Query<
+        (),
+        With<MetalFxRayReconstruction>,
+    >,
     render_device: Res<RenderDevice>,
     mut ctx: RenderContext,
 ) {
+    // A vendor ray reconstruction denoiser replaces SVGF wholesale on views that have one;
+    // running both would double-denoise and waste a chunk of frame time.
+    #[allow(unused_mut)]
+    let mut vendor_rr_active = false;
+    #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
+    {
+        vendor_rr_active |= dlss_rr.get(view.entity()).is_ok();
+    }
+    #[cfg(all(feature = "metalfx", target_vendor = "apple"))]
+    {
+        vendor_rr_active |= metalfx_rr.get(view.entity()).is_ok();
+    }
+    if vendor_rr_active {
+        return;
+    }
+
     let (
         resources,
         view_target,
