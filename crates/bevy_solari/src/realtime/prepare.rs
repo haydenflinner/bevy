@@ -231,7 +231,8 @@ pub fn prepare_solari_lighting_resources(
 
         let world_cache_active_cells_dispatch = render_device.create_buffer(&BufferDescriptor {
             label: Some("solari_lighting_world_cache_active_cells_dispatch"),
-            size: size_of::<[u32; 3]>() as u64,
+            // The shader declares a vec3<u32>, which is 12 bytes but 16-byte aligned on Metal.
+            size: size_of::<[u32; 4]>() as u64,
             usage: BufferUsages::INDIRECT | BufferUsages::STORAGE,
             mapped_at_creation: false,
         });
