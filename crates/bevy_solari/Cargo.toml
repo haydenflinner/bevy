@@ -1,6 +1,6 @@
 [package]
 name = "bevy_solari"
-version = "0.20.0-dev"
+version = "0.20.0"
 edition = "2024"
 description = "Provides raytraced lighting for Bevy Engine"
 homepage = "https://bevy.org"

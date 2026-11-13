@@ -50,6 +50,7 @@ pub fn metalfx_ray_reconstruction(
         view.into_inner();
 
     let Some(prepass_motion_vectors_texture) = &prepass_textures.motion_vectors else {
+        warn!("metalfx_rr: view lacks motion vector prepass texture");
         return;
     };
 
@@ -78,6 +79,7 @@ pub fn metalfx_ray_reconstruction(
         mtl_texture(&rr_textures.specular_hit_distance.texture),
     )
     else {
+        warn!("metalfx_rr: failed to get Metal texture handle for an input/output");
         return;
     };
 
